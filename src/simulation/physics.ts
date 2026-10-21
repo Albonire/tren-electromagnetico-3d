@@ -13,20 +13,24 @@ export interface TrackFrame {
 export interface ElectromagneticTrainState {
   /** Normalized position along the closed track loop [0, 1) */
   u: number;
-  /** Direction of travel: +1 (standard forward) or -1 (reversed battery polarity) */
+  /** Battery polarity: sign of the propulsion force along +u (+1 forward, -1 reversed) */
   direction: 1 | -1;
-  /** Distance traveled in meters */
+  /** Distance traveled in meters (always increasing) */
   distanceMeters: number;
-  /** Instantaneous linear speed magnitude in world units/s */
+  /** Signed velocity along +u in m/s (can oppose `direction` while braking after a reversal) */
+  velocity: number;
+  /** Speed magnitude in m/s */
   speed: number;
-  /** Instantaneous tangential acceleration in world units/s^2 */
+  /** Instantaneous tangential acceleration in m/s^2 */
   acceleration: number;
   /** Electric current in Amperes flowing through the bridged coil turns */
   currentAmps: number;
-  /** Axial solenoid magnetic field B inside bridged turns (mT) */
+  /** Axial solenoid magnetic field B = mu0 * n * I inside bridged turns (mT) */
   magneticFieldmT: number;
-  /** Net electromagnetic Lorentz/Laplace propulsion force (N) */
+  /** Electromagnetic propulsion force magnitude on the magnets (N) */
   propulsionForceN: number;
+  /** Whether the battery circuit is closed through the coil (both magnets touch copper) */
+  circuitClosed: boolean;
   /** Sliding contact spark intensity [0..1] at magnet-to-coil brushes */
   sparkIntensity: number;
   /** Whether the battery train is currently inside the wire coil (vs crossing the open gap) */
@@ -347,99 +351,153 @@ export function uToTurnIndex(u: number): number {
 }
 
 /**
- * Computes the electromagnetic state (current, magnetic field, propulsion force, active turns, spark intensity)
- * for a given normalized train center position u, speed, and polarity direction.
+ * Physical model of the homopolar "magnet train" (SI units).
+ *
+ * The battery and the two neodymium stacks close a circuit through the copper turns that lie between
+ * the magnets. That stretch of coil becomes a short solenoid with B = mu0 * n * I. Each magnet sits at
+ * one end of that solenoid, where the field gradient pushes on its dipole moment; with like poles facing
+ * outward both pushes point the same way. Using F ~ m * dB/dz over a transition length of about 2a gives
+ * a force constant k = F / I. The same k sets the back-EMF (k * v), so energy is conserved.
+ *
+ * When a magnet rides over the open gap (insulated anodized ruler) the circuit opens: no current, no
+ * force, and the train has to coast across on its own momentum.
+ */
+export const PHYSICS = {
+  batteryEmfV: 1.5,
+  /** Internal resistance of an alkaline AA under heavy load plus magnet-to-wire contact resistance */
+  circuitResistanceOhm: 0.65,
+  /** Bare copper wire resistance of the full coil (~29 m of 2.15 mm wire) */
+  fullCoilResistanceOhm: 0.135,
+  /** Dipole moment of one stack of four 17 x 2.6 mm N52 discs (M ~ 1.15e6 A/m) */
+  magnetDipoleMomentAm2: 2.8,
+  /** AA cell (23 g) plus two stacks of NdFeB discs (18 g each) */
+  trainMassKg: 0.059,
+  /** Sliding/rolling friction against the wire turns */
+  kineticFriction: 0.05,
+  staticFriction: 0.08,
+  /** Velocity-proportional contact losses (bouncing on the turns, micro-arcing) per magnet on copper, N*s/m */
+  contactDampingPerMagnet: 0.095,
+  gravity: 9.81,
+};
+
+const MU0 = 4e-7 * Math.PI;
+/** 1 world unit = 10 cm */
+export const METERS_PER_UNIT = 0.1;
+
+export function getCoilTurnsPerMeter(): number {
+  const coilLengthM =
+    (COIL_END_U - COIL_START_U) * getTrackArcLength() * METERS_PER_UNIT;
+  return TOTAL_COIL_TURNS / coilLengthM;
+}
+
+/** Force constant k (N/A): F = k * I and back-EMF = k * v. */
+export function getForceConstant(): number {
+  const coilRadiusM = COIL_RADIUS_UNITS * METERS_PER_UNIT;
+  return (
+    (2 * PHYSICS.magnetDipoleMomentAm2 * MU0 * getCoilTurnsPerMeter()) /
+    (2 * coilRadiusM)
+  );
+}
+
+function isOnCopper(u: number): boolean {
+  return u >= COIL_START_U && u <= COIL_END_U;
+}
+
+/** Sign of travel: follows the velocity, falls back to the polarity when (almost) at rest. */
+export function travelSign(state: ElectromagneticTrainState): 1 | -1 {
+  if (state.velocity > 0.01) return 1;
+  if (state.velocity < -0.01) return -1;
+  return state.direction;
+}
+
+/**
+ * Computes the electromagnetic state (circuit, current, field, force, energized turns, sparks)
+ * for a train centered at normalized position u moving with signed velocity (m/s).
  */
 export function computeElectromagneticState(
   u: number,
-  speed: number,
+  velocity: number,
   distanceMeters = 0,
   lapCount = 0,
   direction: 1 | -1 = 1
 ): ElectromagneticTrainState {
   const normU = wrapU(u);
   const trackLen = getTrackArcLength();
-  // Exact normalized offset from battery center (z = 0) to the center of the rear and front Neodymium magnet stacks
   const halfTrainDeltaU = TRAIN_MAGNET_CENTER_OFFSET_UNITS / trackLen;
 
   const lowMagnetU = wrapU(normU - halfTrainDeltaU);
   const highMagnetU = wrapU(normU + halfTrainDeltaU);
+  const lowInCoil = isOnCopper(lowMagnetU);
+  const highInCoil = isOnCopper(highMagnetU);
 
-  const lowInCoil = lowMagnetU >= COIL_START_U && lowMagnetU <= COIL_END_U;
-  const highInCoil = highMagnetU >= COIL_START_U && highMagnetU <= COIL_END_U;
-  const centerInCoil = normU >= COIL_START_U && normU <= COIL_END_U;
-
-  let coilCoupling = 0;
-  if (lowInCoil && highInCoil && lowMagnetU < highMagnetU) {
-    coilCoupling = 1.0;
-  } else if (highInCoil || lowInCoil || centerInCoil) {
-    coilCoupling = 0.68;
-  } else {
-    coilCoupling = 0.18;
-  }
+  const circuitClosed = lowInCoil && highInCoil;
+  // Normally the energized stretch lies between the magnets. When the train straddles the gap with both
+  // magnets on copper, the current has to go the long way round through the entire coil.
+  const straddlesGap = circuitClosed && lowMagnetU > highMagnetU;
 
   let startTurn = -1;
   let endTurn = -1;
-  if (lowInCoil && highInCoil && lowMagnetU < highMagnetU) {
+  if (circuitClosed && !straddlesGap) {
     startTurn = uToTurnIndex(lowMagnetU);
     endTurn = uToTurnIndex(highMagnetU);
-  } else if (highInCoil && !lowInCoil) {
+  } else if (straddlesGap) {
     startTurn = 0;
-    endTurn = Math.max(6, uToTurnIndex(highMagnetU));
-  } else if (lowInCoil && !highInCoil) {
-    startTurn = Math.min(TOTAL_COIL_TURNS - 7, uToTurnIndex(lowMagnetU));
     endTurn = TOTAL_COIL_TURNS - 1;
   }
 
-  // Physical constants for AA 1.5V battery + N52 Neodymium magnets in bare copper coil
-  const batteryVoltage = 1.5; // Volts
-  const segmentResistance = 0.82; // Ohms
-  const backEmf = 0.08 * speed;
-  const currentAmps =
-    coilCoupling >= 0.5
-      ? Math.max(0, ((batteryVoltage - backEmf) / segmentResistance) * coilCoupling)
-      : 0;
+  const k = getForceConstant();
+  const resistance =
+    PHYSICS.circuitResistanceOhm +
+    (straddlesGap ? PHYSICS.fullCoilResistanceOhm : 0);
+  // Back-EMF opposes the current only when the train moves along the force direction
+  const backEmf = k * velocity * direction;
+  const currentAmps = circuitClosed
+    ? Math.max(0, (PHYSICS.batteryEmfV - backEmf) / resistance)
+    : 0;
+  const magneticFieldmT = MU0 * getCoilTurnsPerMeter() * currentAmps * 1000;
+  const propulsionForceN = k * currentAmps;
 
-  const magneticFieldmT = currentAmps * 6.8;
-
-  // Lorentz / Laplace force + extra magnetic reluctance suction at coil mouths
-  const mouthTransitionBoost =
-    coilCoupling > 0.5 && coilCoupling < 1.0 ? 1.18 : 1.0;
-  const propulsionForceN =
-    coilCoupling >= 0.5
-      ? currentAmps * 0.32 * mouthTransitionBoost
-      : 0.24;
-
+  // Net tangential force (signed along +u)
+  const magnetsOnCopper = (lowInCoil ? 1 : 0) + (highInCoil ? 1 : 0);
   const frame = evaluateTrackFrame(normU);
-  // Sliding brush spark intensity increases with current, speed, curvature, and coil mouth entry/exit
-  const mouthSparkBoost = coilCoupling > 0.4 && coilCoupling < 1.0 ? 0.35 : 0.0;
+  const curvaturePerM = frame.curvature / METERS_PER_UNIT;
+  const centripetal = velocity * velocity * curvaturePerM;
+  const normalForce =
+    PHYSICS.trainMassKg * Math.hypot(PHYSICS.gravity, centripetal);
+  const drive = propulsionForceN * direction;
+  const damping = PHYSICS.contactDampingPerMagnet * magnetsOnCopper * velocity;
+  const friction =
+    Math.abs(velocity) > 1e-4
+      ? PHYSICS.kineticFriction * normalForce * Math.sign(velocity)
+      : 0;
+  const acceleration = (drive - damping - friction) / PHYSICS.trainMassKg;
+
+  // Contact sparks grow with current and sliding speed; a magnet entering or leaving copper arcs hardest
+  const atMouth = lowInCoil !== highInCoil || straddlesGap;
   const sparkIntensity =
-    currentAmps > 0.1
+    currentAmps > 0.05
       ? THREE.MathUtils.clamp(
-          0.35 + speed * 0.25 + frame.curvature * 0.45 + mouthSparkBoost,
+          (currentAmps / 2.3) * (0.35 + 0.65 * Math.min(1, Math.abs(velocity) / 0.6)) +
+            (atMouth ? 0.3 : 0),
           0,
           1
         )
       : 0;
 
-  const trainMassKg = 0.032; // 32g
-  const curveFrictionDrag = frame.curvature * 0.025 * speed;
-  const frictionAndDragN = 0.06 + speed * 0.27 + curveFrictionDrag;
-  const netForceN = propulsionForceN - frictionAndDragN;
-  const acceleration = netForceN / trainMassKg;
-
   return {
     u: normU,
     direction,
     distanceMeters,
-    speed,
+    velocity,
+    speed: Math.abs(velocity),
     acceleration,
-    currentAmps: Number(currentAmps.toFixed(2)),
-    magneticFieldmT: Number(magneticFieldmT.toFixed(1)),
-    propulsionForceN: Number(propulsionForceN.toFixed(3)),
-    sparkIntensity: Number(sparkIntensity.toFixed(2)),
+    currentAmps,
+    magneticFieldmT,
+    propulsionForceN,
+    circuitClosed,
+    sparkIntensity,
     inCoil: lowInCoil || highInCoil,
-    coilCoupling,
+    coilCoupling: circuitClosed ? (straddlesGap ? 0.9 : 1) : 0,
     activeTurnRange: [startTurn, endTurn],
     totalTurns: TOTAL_COIL_TURNS,
     lapCount,
@@ -447,79 +505,59 @@ export function computeElectromagneticState(
 }
 
 /**
- * Advances the electromagnetic train state by dt seconds using 4x sub-stepping RK2 integration
- * for ultra-smooth, physically realistic motion across curves and coil mouths.
+ * Advances the train by dt seconds of simulated time (semi-implicit Euler, 8 sub-steps) with
+ * static friction: a train at rest only starts moving when the drive overcomes it.
  */
 export function stepTrainPhysics(
   state: ElectromagneticTrainState,
-  dt: number,
-  speedMultiplier = 1.0
+  dt: number
 ): ElectromagneticTrainState {
   const clampedDt = Math.min(Math.max(dt, 0), 0.05);
-  const subSteps = 4;
+  const subSteps = 8;
   const subDt = clampedDt / subSteps;
-  const trackLen = getTrackArcLength();
+  const trackLenM = getTrackArcLength() * METERS_PER_UNIT;
 
-  let curU = state.u;
-  let curSpeed = state.speed;
-  let curDistMeters = state.distanceMeters;
-  let curLapCount = state.lapCount;
+  let cur = state;
+  let u = state.u;
+  let v = state.velocity;
+  let dist = state.distanceMeters;
+  let laps = state.lapCount;
   const dir = state.direction;
 
   for (let s = 0; s < subSteps; s++) {
-    const k1 = computeElectromagneticState(
-      curU,
-      curSpeed,
-      curDistMeters,
-      curLapCount,
-      dir
-    );
-    const midSpeed = THREE.MathUtils.clamp(
-      curSpeed + k1.acceleration * (subDt * 0.5),
-      0.55,
-      1.85
-    );
-    const midDeltaUnits = midSpeed * speedMultiplier * (subDt * 0.5);
-    const midU = wrapU(curU + (midDeltaUnits / trackLen) * dir);
+    cur = computeElectromagneticState(u, v, dist, laps, dir);
 
-    const k2 = computeElectromagneticState(
-      midU,
-      midSpeed,
-      curDistMeters + midDeltaUnits * 0.1,
-      curLapCount,
-      dir
-    );
-
-    curSpeed = THREE.MathUtils.clamp(
-      curSpeed + k2.acceleration * subDt,
-      0.55,
-      1.85
-    );
-    const stepUnits = curSpeed * speedMultiplier * subDt;
-    const signedDeltaU = (stepUnits / trackLen) * dir;
-    const rawNextU = curU + signedDeltaU;
-
-    if (dir === 1 && rawNextU >= 1.0) {
-      curLapCount += Math.floor(rawNextU);
-    } else if (dir === -1 && rawNextU < 0.0) {
-      curLapCount += Math.ceil(Math.abs(rawNextU));
+    if (Math.abs(v) < 1e-4) {
+      const drive = cur.propulsionForceN;
+      const holding =
+        PHYSICS.staticFriction * PHYSICS.trainMassKg * PHYSICS.gravity;
+      if (drive <= holding) {
+        v = 0;
+        continue;
+      }
     }
 
-    curU = wrapU(rawNextU);
-    curDistMeters += stepUnits * 0.1;
+    const nextV = v + cur.acceleration * subDt;
+    // Friction and damping can stop the train but never push it backwards on their own
+    const drivePushesBack = cur.propulsionForceN * dir * Math.sign(v) < 0;
+    v =
+      v !== 0 && Math.sign(nextV) !== Math.sign(v) && !drivePushesBack
+        ? 0
+        : nextV;
+
+    const rawNextU = u + (v * subDt) / trackLenM;
+    if (rawNextU >= 1) laps += 1;
+    else if (rawNextU < 0) laps += 1;
+    u = wrapU(rawNextU);
+    dist += Math.abs(v) * subDt;
   }
 
-  return computeElectromagneticState(
-    curU,
-    curSpeed,
-    curDistMeters,
-    curLapCount,
-    dir
-  );
+  return computeElectromagneticState(u, v, dist, laps, dir);
 }
 
 /**
- * Reverses the polarity/direction of the electromagnetic train (simulating flipping the battery + magnets inside the coil).
+ * Reverses the battery polarity. The train keeps its momentum, so it first brakes under the
+ * reversed force and then accelerates the other way.
  */
 export function reverseTrainPolarity(
   state: ElectromagneticTrainState
@@ -527,7 +565,7 @@ export function reverseTrainPolarity(
   const nextDirection: 1 | -1 = state.direction === 1 ? -1 : 1;
   return computeElectromagneticState(
     state.u,
-    Math.max(0.75, state.speed * 0.85),
+    state.velocity,
     state.distanceMeters,
     state.lapCount,
     nextDirection
@@ -549,7 +587,7 @@ export interface PovCameraFrame {
 export function computeFirstPersonPovFrame(
   state: ElectromagneticTrainState
 ): PovCameraFrame {
-  const dir = state.direction;
+  const dir = travelSign(state);
   const trackLen = getTrackArcLength();
   // Mount the POV lens in the upper tunnel headspace right above the front shoulder (+0.21 units ahead of center)
   const eyeU = wrapU(state.u + (0.21 / trackLen) * dir);
@@ -615,7 +653,7 @@ export function computeCoilTurnPerturbation(
   elapsedTime: number
 ): CoilTurnPerturbation {
   const trackLen = getTrackArcLength();
-  const dir = state.direction;
+  const dir = travelSign(state);
   const dsCenter = circularDeltaU(uTurn, state.u) * trackLen * dir;
 
   // Outside the active interaction & elastic wake zone, the copper coil rests undisturbed
@@ -647,12 +685,11 @@ export function computeCoilTurnPerturbation(
   // Solenoid bridge envelope between the two magnet stacks
   const normBridge = dsCenter / (TRAIN_MAGNET_CENTER_OFFSET_UNITS * 1.08);
   const bridgeEnv =
-    Math.exp(-Math.pow(normBridge, 4)) *
-    Math.min(1, Math.max(0.35, state.currentAmps / 1.65));
+    Math.exp(-Math.pow(normBridge, 4)) * Math.min(1, state.currentAmps / 2.0);
 
   // Damped elastic spring wake trailing behind the rear magnet stack (dsRear < 0)
   const wakeDist = -dsRear;
-  const speedFactor = THREE.MathUtils.clamp(state.speed / 1.1, 0.5, 1.6);
+  const speedFactor = THREE.MathUtils.clamp(state.speed / 0.6, 0, 1.4);
   const wakeEnv =
     wakeDist > 0 && wakeDist < 1.15
       ? Math.exp(-wakeDist * 3.1) *
@@ -730,11 +767,14 @@ export function computeCoilTurnPerturbation(
     1
   );
 
+  // The raw envelopes above describe the shape of the disturbance. A real coil barely moves (the train
+  // weighs ~0.6 N), so displacements are scaled to roughly a millimetre: visible up close, not rubbery.
+  const REALISM_SCALE = 0.14;
   return {
-    radialDelta,
-    axialDelta,
-    lateralDelta: lateralWave,
-    verticalArchDelta,
+    radialDelta: radialDelta * REALISM_SCALE,
+    axialDelta: axialDelta * REALISM_SCALE,
+    lateralDelta: lateralWave * REALISM_SCALE,
+    verticalArchDelta: verticalArchDelta * REALISM_SCALE,
     intensity,
   };
 }

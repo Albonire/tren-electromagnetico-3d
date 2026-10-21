@@ -11,6 +11,10 @@ import {
   reverseTrainPolarity,
   evaluateTrackFrame,
   findClosestTrackU,
+  travelSign,
+  circularDeltaU,
+  getTrackArcLength,
+  METERS_PER_UNIT,
   computeFirstPersonPovFrame,
   ElectromagneticTrainState,
 } from './physics';
@@ -59,11 +63,11 @@ export default function ElectromagneticTrainCanvas() {
     showExplicitFields: true,
     showPip: true,
     direction: 1,
-    speedMultiplier: 0.55,
-    currentAmps: 1.71,
-    magneticFieldmT: 11.6,
-    propulsionForceN: 0.547,
-    speedCmPerS: 6.7,
+    speedMultiplier: 0.1,
+    currentAmps: 0,
+    magneticFieldmT: 0,
+    propulsionForceN: 0,
+    speedCmPerS: 0,
     lapCount: 0,
   });
   const [callouts, setCallouts] = useState<CalloutInfo[]>([]);
@@ -194,7 +198,7 @@ export default function ElectromagneticTrainCanvas() {
 
     // 6. Build 3D Laboratory Environment, Helical Wire Coil, and Electromagnetic Train Rig
     const maxAnisotropy = renderer.capabilities.getMaxAnisotropy();
-    buildLabEnvironment(scene, maxAnisotropy, isSoftwareGl);
+    const labEnvironment = buildLabEnvironment(scene, maxAnisotropy, isSoftwareGl);
     const coilRig = buildHelicalCoilSystem(maxAnisotropy, isSoftwareGl);
     scene.add(coilRig.group);
 
@@ -215,9 +219,10 @@ export default function ElectromagneticTrainCanvas() {
     }
 
     // 7. Simulation State & Interactive Camera / Field Controls
+    // The train starts at rest just past the gap and accelerates on its own
     let simState: ElectromagneticTrainState = computeElectromagneticState(
-      COIL_START_U + 0.03,
-      1.22,
+      COIL_START_U + 0.05,
+      0,
       0,
       0,
       1
@@ -225,7 +230,8 @@ export default function ElectromagneticTrainCanvas() {
     let isPaused = false;
     let showExplicitFields = true;
     let showPipViewport = true;
-    let speedMultiplier = 0.55;
+    // Time scale of the simulation (1 = real time); the real train is too fast to follow at 1x
+    let speedMultiplier = 0.1;
     let cameraMode: CameraMode = 'overview';
     let userInteractingWithOrbit = false;
     let isDraggingTrain = false;
@@ -266,7 +272,7 @@ export default function ElectromagneticTrainCanvas() {
         magneticFieldmT: simState.magneticFieldmT,
         propulsionForceN: simState.propulsionForceN,
         // 1 world unit = 10 cm; displacement is scaled by the playback multiplier
-        speedCmPerS: simState.speed * speedMultiplier * 10,
+        speedCmPerS: simState.speed * 100,
         lapCount: simState.lapCount,
       });
     };
@@ -311,7 +317,7 @@ export default function ElectromagneticTrainCanvas() {
         .copy(frame.position)
         .addScaledVector(frame.binormal, 1.72)
         .addScaledVector(frame.normal, 1.05)
-        .addScaledVector(frame.tangent, -0.45 * simState.direction);
+        .addScaledVector(frame.tangent, -0.45 * travelSign(simState));
       controls.update();
     };
 
@@ -322,7 +328,7 @@ export default function ElectromagneticTrainCanvas() {
         .addScaledVector(frame.normal, 0.16);
       camera.position
         .copy(frame.position)
-        .addScaledVector(frame.tangent, 1.15 * simState.direction)
+        .addScaledVector(frame.tangent, 1.15 * travelSign(simState))
         .addScaledVector(frame.binormal, 1.05)
         .addScaledVector(frame.normal, 0.58);
       controls.update();
@@ -365,10 +371,10 @@ export default function ElectromagneticTrainCanvas() {
       syncBodyDataset();
     };
 
-    const setTrainUImmediate = (targetU: number) => {
+    const setTrainUImmediate = (targetU: number, velocity = 0) => {
       simState = computeElectromagneticState(
         targetU,
-        simState.speed,
+        velocity,
         simState.distanceMeters,
         simState.lapCount,
         simState.direction
@@ -439,6 +445,10 @@ export default function ElectromagneticTrainCanvas() {
       -(COIL_RADIUS_UNITS + WIRE_RADIUS_UNITS)
     );
     const dragHitPoint = new THREE.Vector3();
+    // Hand velocity while dragging (simulated m/s), so releasing the train throws it
+    let dragLastU = 0;
+    let dragLastTime = 0;
+    let dragVelocity = 0;
 
     const onPointerDown = (e: PointerEvent) => {
       if (cameraMode === 'pov') return;
@@ -460,8 +470,12 @@ export default function ElectromagneticTrainCanvas() {
         isDraggingTrain = true;
         controls.enabled = false;
         renderer.domElement.style.cursor = 'grabbing';
+        dragVelocity = 0;
+        dragLastU = simState.u;
+        dragLastTime = performance.now();
         if (e.shiftKey && raycaster.ray.intersectPlane(dragPlane, dragHitPoint)) {
-          setTrainUImmediate(findClosestTrackU(dragHitPoint));
+          dragLastU = findClosestTrackU(dragHitPoint);
+          setTrainUImmediate(dragLastU);
         }
       }
     };
@@ -475,7 +489,21 @@ export default function ElectromagneticTrainCanvas() {
         raycaster.setFromCamera(pointerNdc, camera);
         if (raycaster.ray.intersectPlane(dragPlane, dragHitPoint)) {
           const nextU = findClosestTrackU(dragHitPoint);
-          setTrainUImmediate(nextU);
+          const now = performance.now();
+          const elapsedMs = Math.max(now - dragLastTime, 1);
+          const handVelocity =
+            (circularDeltaU(nextU, dragLastU) * getTrackArcLength() * METERS_PER_UNIT) /
+            (elapsedMs / 1000) /
+            Math.max(speedMultiplier, 0.01);
+          const blend = 1 - Math.exp(-elapsedMs / 60);
+          dragVelocity = THREE.MathUtils.clamp(
+            dragVelocity + (handVelocity - dragVelocity) * blend,
+            -1.2,
+            1.2
+          );
+          dragLastU = nextU;
+          dragLastTime = now;
+          setTrainUImmediate(nextU, dragVelocity);
         }
         return;
       }
@@ -502,6 +530,9 @@ export default function ElectromagneticTrainCanvas() {
     const onPointerUp = () => {
       if (!isDraggingTrain) return;
       isDraggingTrain = false;
+      // A hand that stopped before letting go does not throw the train
+      const heldStill = performance.now() - dragLastTime > 120;
+      setTrainUImmediate(simState.u, heldStill ? 0 : dragVelocity);
       if (cameraMode !== 'pov') {
         controls.enabled = true;
       }
@@ -713,13 +744,17 @@ export default function ElectromagneticTrainCanvas() {
       lastTime = now;
       const dt = isSoftwareGl ? 1 / 30 : rawDt;
 
+      // Everything physical (motion, sparks, electrons) runs in simulated time
+      const simDt = dt * speedMultiplier;
+      labEnvironment.update(dt, now / 1000);
+
       if (!isPaused && !isDraggingTrain) {
-        elapsedTime += dt;
-        simState = stepTrainPhysics(simState, dt, speedMultiplier);
+        elapsedTime += simDt;
+        simState = stepTrainPhysics(simState, simDt);
         coilRig.updateActiveTurns(
           simState,
           elapsedTime,
-          dt,
+          simDt,
           showExplicitFields
         );
         trainRig.updateTrainPose(simState, elapsedTime, showExplicitFields);
@@ -729,11 +764,11 @@ export default function ElectromagneticTrainCanvas() {
           syncBodyDataset();
         }
       } else if (isDraggingTrain) {
-        elapsedTime += dt;
+        elapsedTime += simDt;
         coilRig.updateActiveTurns(
           simState,
           elapsedTime,
-          dt,
+          simDt,
           showExplicitFields
         );
         trainRig.updateTrainPose(simState, elapsedTime, showExplicitFields);
@@ -748,7 +783,7 @@ export default function ElectromagneticTrainCanvas() {
           .copy(frame.position)
           .addScaledVector(frame.binormal, 1.72)
           .addScaledVector(frame.normal, 1.05)
-          .addScaledVector(frame.tangent, -0.45 * simState.direction);
+          .addScaledVector(frame.tangent, -0.45 * travelSign(simState));
 
         const dampFactor = 1 - Math.exp(-6.0 * dt);
         camera.position.lerp(desiredCamPos, dampFactor);
@@ -761,7 +796,7 @@ export default function ElectromagneticTrainCanvas() {
           .addScaledVector(frame.normal, 0.16);
         desiredCamPos
           .copy(frame.position)
-          .addScaledVector(frame.tangent, 1.15 * simState.direction)
+          .addScaledVector(frame.tangent, 1.15 * travelSign(simState))
           .addScaledVector(frame.binormal, 1.05)
           .addScaledVector(frame.normal, 0.58);
 
@@ -771,6 +806,14 @@ export default function ElectromagneticTrainCanvas() {
         controls.update();
       } else {
         controls.update();
+      }
+
+      // Keep the subject crisp at any zoom while the far end of the room dissolves into darkness
+      if (scene.fog instanceof THREE.Fog) {
+        const focusDist =
+          cameraMode === 'pov' ? 1.5 : camera.position.distanceTo(controls.target);
+        scene.fog.near = Math.max(2.5, focusDist * 1.15);
+        scene.fog.far = Math.max(9, focusDist * 3.2);
       }
 
       renderDualViewportFrame();

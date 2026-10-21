@@ -33,11 +33,12 @@ export const CAMERA_MODES: ReadonlyArray<{
   { mode: 'pov', label: 'A bordo', shortcut: '5', Icon: ScanEye },
 ];
 
-/** Playback rates relative to the calibrated real-time multiplier (0.55). */
+/** Simulation time scale (1 = real time). The real train covers the track in about 1.5 s. */
 export const SPEED_PRESETS: ReadonlyArray<{ label: string; value: number }> = [
-  { label: '0.5×', value: 0.275 },
-  { label: '1×', value: 0.55 },
-  { label: '2×', value: 1.1 },
+  { label: '0.1×', value: 0.1 },
+  { label: '0.25×', value: 0.25 },
+  { label: '0.5×', value: 0.5 },
+  { label: '1×', value: 1 },
 ];
 
 export function nearestSpeedPresetIndex(multiplier: number): number {
@@ -325,7 +326,7 @@ function Dock({
       {compact ? (
         <button
           type="button"
-          aria-label={`Velocidad ${SPEED_PRESETS[speedIndex].label}. Toca para cambiar`}
+          aria-label={`Escala de tiempo ${SPEED_PRESETS[speedIndex].label}. Toca para cambiar`}
           onClick={() =>
             actions.setSpeed(SPEED_PRESETS[(speedIndex + 1) % SPEED_PRESETS.length].value)
           }
@@ -336,7 +337,7 @@ function Dock({
       ) : (
         <Segmented
           id="speed"
-          ariaLabel="Velocidad de reproducción"
+          ariaLabel="Escala de tiempo"
           value={speedIndex}
           onChange={(i) => actions.setSpeed(SPEED_PRESETS[i].value)}
           options={SPEED_PRESETS.map((p, i) => ({ value: i, label: p.label }))}
@@ -400,7 +401,7 @@ function TelemetryCard({ ui, compact }: { ui: SimulationUiState; compact: boolea
       <Metric compact={compact} label="Corriente" value={ui.currentAmps.toFixed(2)} unit="A" dot="#64d2ff" />
       <Metric compact={compact} label="Campo" value={ui.magneticFieldmT.toFixed(1)} unit="mT" dot="#0a84ff" />
       <Metric compact={compact} label="Fuerza" value={ui.propulsionForceN.toFixed(2)} unit="N" dot="#30d158" />
-      <Metric compact={compact} label="Velocidad" value={ui.speedCmPerS.toFixed(1)} unit="cm/s" dot="#ffd60a" />
+      <Metric compact={compact} label="Velocidad" value={ui.speedCmPerS.toFixed(0)} unit="cm/s" dot="#ffd60a" />
     </>
   );
 
@@ -493,7 +494,7 @@ function HelpSheet({ open, onClose }: { open: boolean; onClose: () => void }) {
   }, [open]);
 
   const gestures: Array<[string, ReactNode]> = [
-    ['Mover el tren', 'Arrastra la pila'],
+    ['Mover o lanzar el tren', 'Arrastra la pila y suéltala'],
     ['Colocar el tren', <><Kbd>Shift</Kbd> + clic en la bobina</>],
     ['Invertir polaridad', 'Doble clic en el tren'],
     ['Orbitar y acercar', 'Arrastra el fondo, rueda o pellizco'],
@@ -503,7 +504,7 @@ function HelpSheet({ open, onClose }: { open: boolean; onClose: () => void }) {
     ['Invertir polaridad', <Kbd>R</Kbd>],
     ['Campos y electrones', <Kbd>F</Kbd>],
     ['Cámaras', <span className="flex gap-1"><Kbd>1</Kbd><Kbd>2</Kbd><Kbd>3</Kbd><Kbd>4</Kbd><Kbd>5</Kbd></span>],
-    ['Velocidad', <span className="flex gap-1"><Kbd>↑</Kbd><Kbd>↓</Kbd></span>],
+    ['Escala de tiempo', <span className="flex gap-1"><Kbd>↑</Kbd><Kbd>↓</Kbd></span>],
     ['Vista secundaria', <Kbd>V</Kbd>],
   ];
 
@@ -536,7 +537,8 @@ function HelpSheet({ open, onClose }: { open: boolean; onClose: () => void }) {
                 </h2>
                 <p className="mt-1.5 text-[13px] leading-[1.45] text-white/60">
                   Los imanes conducen la corriente de la pila a través de las espiras que tocan. Ese tramo de
-                  bobina se convierte en un electroimán que empuja a los imanes, y el tren avanza solo.
+                  bobina se convierte en un electroimán que empuja a los imanes, y el tren avanza solo. Sobre
+                  la regleta el circuito se abre: el tren cruza el hueco solo por inercia.
                 </p>
               </div>
               <button
@@ -649,6 +651,9 @@ export function SimulationUi({
   setHelpOpen: (open: boolean) => void;
 }) {
   const [showHint, setShowHint] = useState(true);
+  // With the circuit open there is no force: a train that stops over the gap stays there
+  const stalled = !ui.isPaused && ui.currentAmps <= 0.05 && ui.speedCmPerS < 0.5;
+  const stallText = 'Circuito abierto: arrastra la pila y suéltala para lanzarla';
   useEffect(() => {
     const t = window.setTimeout(() => setShowHint(false), 7000);
     return () => window.clearTimeout(t);
@@ -659,7 +664,12 @@ export function SimulationUi({
       <div className="pointer-events-none absolute inset-0 z-10 font-sans text-white antialiased">
         <div className={`absolute flex flex-col items-center gap-2 ${compact ? 'inset-x-3 top-3' : 'left-5 top-5'}`}>
           <TelemetryCard ui={ui} compact={compact} />
-          {compact && <Hint show={showHint && !helpOpen} text="Arrastra la pila para moverla" />}
+          {compact && (
+            <Hint
+              show={(stalled || showHint) && !helpOpen}
+              text={stalled ? stallText : 'Arrastra la pila para moverla'}
+            />
+          )}
         </div>
 
         {ui.showPip && (
@@ -674,8 +684,12 @@ export function SimulationUi({
         <div className={`absolute inset-x-0 flex flex-col items-center gap-3 ${compact ? 'bottom-3' : 'bottom-5'}`}>
           {!compact && (
             <Hint
-              show={showHint && !helpOpen}
-              text="Arrastra la pila para moverla · Pulsa ? para ver los atajos"
+              show={(stalled || showHint) && !helpOpen}
+              text={
+                stalled
+                  ? stallText
+                  : 'Arrastra la pila para moverla o lanzarla · Pulsa ? para ver los atajos'
+              }
             />
           )}
           <Dock

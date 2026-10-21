@@ -1,5 +1,7 @@
 import * as THREE from 'three';
 import {
+  METERS_PER_UNIT,
+  travelSign,
   COIL_START_U,
   COIL_END_U,
   TOTAL_COIL_TURNS,
@@ -24,8 +26,8 @@ import {
   createTabletopMicroTexture,
   createCoilRibbonShadowTexture,
   createSoftShadowTexture,
-  createStudioBackdropTexture,
   createWindowSunbeamTexture,
+  createSoftDotTexture,
   createPovMicroLabelSprite,
   createPrecisionWorkbenchScaleTexture,
 } from './textures';
@@ -112,11 +114,17 @@ export function getTurnNormalizedU(turnIndex: number): number {
  * the 3D physical precision ruler ("regleta milimetrada") between the two open coil mouths,
  * subtle volumetric sunbeam shafts from the nearby upper-right window, and dark studio backdrop.
  */
+export interface LabEnvironment {
+  group: THREE.Group;
+  /** Advances ambient animation (dust drifting in the sunbeams); dt and time in real seconds */
+  update: (dt: number, time: number) => void;
+}
+
 export function buildLabEnvironment(
   scene: THREE.Scene,
   maxAnisotropy: number,
   isSoftwareGl: boolean
-): THREE.Group {
+): LabEnvironment {
   const envGroup = new THREE.Group();
   const tableAlbedo = createTabletopAlbedoTexture(maxAnisotropy);
   const tableBump = createTabletopMicroTexture(maxAnisotropy);
@@ -138,17 +146,50 @@ export function buildLabEnvironment(
   tableMesh.receiveShadow = !isSoftwareGl;
   envGroup.add(tableMesh);
 
-  // Dark anodized titanium back edge trim of the lab bench
-  const edgeGeo = new THREE.BoxGeometry(16.02, 0.225, 0.045);
-  const edgeMat = new THREE.MeshStandardMaterial({
-    color: 0x0f172a,
-    roughness: 0.42,
-    metalness: 0.55,
-    envMapIntensity: 0.15,
+  // Seamless studio sweep (cyclorama): the bench continues into a floor that curves up into the
+  // wall, so there is no hard horizon line, and fog dissolves it into the dark room.
+  const sweepColor = 0x0b0e14;
+  const sweepMat = new THREE.MeshStandardMaterial({
+    color: sweepColor,
+    roughness: 0.92,
+    metalness: 0.0,
+    envMapIntensity: 0.04,
   });
-  const backEdge = new THREE.Mesh(edgeGeo, edgeMat);
-  backEdge.position.set(0, -0.11, -3.2);
-  envGroup.add(backEdge);
+  const sweepProfile: THREE.Vector2[] = [];
+  const sweepRadius = 2.6;
+  const sweepStartZ = -3.1;
+  sweepProfile.push(new THREE.Vector2(22, -0.0015));
+  sweepProfile.push(new THREE.Vector2(sweepStartZ, -0.0015));
+  for (let i = 1; i <= 16; i++) {
+    const a = (i / 16) * (Math.PI / 2);
+    sweepProfile.push(
+      new THREE.Vector2(
+        sweepStartZ - Math.sin(a) * sweepRadius,
+        sweepRadius - Math.cos(a) * sweepRadius
+      )
+    );
+  }
+  sweepProfile.push(new THREE.Vector2(sweepStartZ - sweepRadius, 9));
+  const sweepPositions: number[] = [];
+  const sweepIndices: number[] = [];
+  const halfWidth = 26;
+  sweepProfile.forEach((p, i) => {
+    sweepPositions.push(-halfWidth, p.y, p.x, halfWidth, p.y, p.x);
+    if (i > 0) {
+      const a0 = (i - 1) * 2;
+      sweepIndices.push(a0, a0 + 1, a0 + 2, a0 + 1, a0 + 3, a0 + 2);
+    }
+  });
+  const sweepGeo = new THREE.BufferGeometry();
+  sweepGeo.setAttribute('position', new THREE.Float32BufferAttribute(sweepPositions, 3));
+  sweepGeo.setIndex(sweepIndices);
+  sweepGeo.computeVertexNormals();
+  const sweepMesh = new THREE.Mesh(sweepGeo, sweepMat);
+  sweepMesh.receiveShadow = !isSoftwareGl;
+  envGroup.add(sweepMesh);
+  scene.background = new THREE.Color(0x07090d);
+  // Linear fog whose range the renderer loop rescales with the camera distance
+  scene.fog = new THREE.Fog(0x07090d, 8, 30);
 
   // 2. Feathered Contact Shadow + Sunlit Copper Caustic Ribbon directly under the heart-shaped coil loop
   const shadowRibbonGeo = buildCoilShadowRibbonGeometry();
@@ -221,17 +262,6 @@ export function buildLabEnvironment(
 
   envGroup.add(regletaGroup);
 
-  // 3. Dark Studio Lab Backdrop with Nearby Side Window on Upper-Right
-  const backdropTex = createStudioBackdropTexture(maxAnisotropy);
-  const backdropGeo = new THREE.PlaneGeometry(14.5, 5.2);
-  const backdropMat = new THREE.MeshBasicMaterial({
-    map: backdropTex,
-    fog: false,
-  });
-  const backdropMesh = new THREE.Mesh(backdropGeo, backdropMat);
-  backdropMesh.position.set(0.15, 1.45, -3.26);
-  envGroup.add(backdropMesh);
-
   // 4. Diagonal Volumetric-Style Sunlight Shafts entering from the nearby upper-right window into the dark room
   const sunbeamTex = createWindowSunbeamTexture();
   const sunbeamMat = new THREE.MeshBasicMaterial({
@@ -257,8 +287,73 @@ export function buildLabEnvironment(
     envGroup.add(beamMesh);
   }
 
+  // 5. Dust motes drifting slowly through the sunbeams; they glint only inside the light shafts
+  const moteCount = isSoftwareGl ? 160 : 420;
+  const motePositions = new Float32Array(moteCount * 3);
+  const moteSeeds = new Float32Array(moteCount);
+  const moteColors = new Float32Array(moteCount * 3);
+  let moteSeed = 4242;
+  const moteRand = () => {
+    moteSeed = (moteSeed * 16807) % 2147483647;
+    return moteSeed / 2147483647;
+  };
+  const moteBox = { x0: -0.4, x1: 3.4, y0: 0.05, y1: 3.4, z0: -1.9, z1: 1.2 };
+  for (let i = 0; i < moteCount; i++) {
+    motePositions[i * 3] = moteBox.x0 + moteRand() * (moteBox.x1 - moteBox.x0);
+    motePositions[i * 3 + 1] = moteBox.y0 + moteRand() * (moteBox.y1 - moteBox.y0);
+    motePositions[i * 3 + 2] = moteBox.z0 + moteRand() * (moteBox.z1 - moteBox.z0);
+    moteSeeds[i] = moteRand() * 1000;
+  }
+  const moteGeo = new THREE.BufferGeometry();
+  moteGeo.setAttribute('position', new THREE.BufferAttribute(motePositions, 3));
+  moteGeo.setAttribute('color', new THREE.BufferAttribute(moteColors, 3));
+  const moteMat = new THREE.PointsMaterial({
+    size: 0.012,
+    map: createSoftDotTexture(),
+    vertexColors: true,
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+    sizeAttenuation: true,
+  });
+  const motes = new THREE.Points(moteGeo, moteMat);
+  motes.layers.set(1);
+  motes.frustumCulled = false;
+  envGroup.add(motes);
+
+  // Beam axis: the sunlight enters from the upper right towards the bench around (0.6, 0, 0)
+  const beamOrigin = new THREE.Vector3(3.9, 3.7, -0.8);
+  const beamDir = new THREE.Vector3(0.42, 0.0, 0.05).sub(beamOrigin).normalize();
+  const toMote = new THREE.Vector3();
+
+  const update = (dt: number, time: number) => {
+    const step = Math.min(dt, 0.05);
+    for (let i = 0; i < moteCount; i++) {
+      const i3 = i * 3;
+      const seed = moteSeeds[i];
+      // Slow Brownian-looking drift plus a faint downward settle
+      motePositions[i3] += Math.sin(time * 0.21 + seed) * 0.012 * step;
+      motePositions[i3 + 1] += (Math.cos(time * 0.17 + seed * 1.3) * 0.01 - 0.004) * step;
+      motePositions[i3 + 2] += Math.sin(time * 0.13 + seed * 0.7) * 0.012 * step;
+      if (motePositions[i3 + 1] < moteBox.y0) motePositions[i3 + 1] = moteBox.y1;
+
+      // Brightness falls off with distance from the beam axis and twinkles as the mote tumbles
+      toMote.set(motePositions[i3], motePositions[i3 + 1], motePositions[i3 + 2]).sub(beamOrigin);
+      const along = toMote.dot(beamDir);
+      const perp = toMote.addScaledVector(beamDir, -along).length();
+      const inBeam = Math.exp(-perp * perp * 1.6);
+      const twinkle = 0.55 + 0.45 * Math.sin(time * 1.7 + seed * 3.1);
+      const lum = inBeam * twinkle * 0.9;
+      moteColors[i3] = lum;
+      moteColors[i3 + 1] = lum * 0.86;
+      moteColors[i3 + 2] = lum * 0.62;
+    }
+    (moteGeo.attributes.position as THREE.BufferAttribute).needsUpdate = true;
+    (moteGeo.attributes.color as THREE.BufferAttribute).needsUpdate = true;
+  };
+
   scene.add(envGroup);
-  return envGroup;
+  return { group: envGroup, update };
 }
 
 /**
@@ -374,8 +469,9 @@ export function buildHelicalCoilSystem(
 
   // 1. Primary Continuous Helical Coil Mesh (Authentic drawn metallic copper C11000)
   const helixCurve = new HelicalSolenoidCurve();
-  const tubularSegments = isSoftwareGl ? 3800 : 6800;
-  const radialSegments = isSoftwareGl ? 7 : 10;
+  // ~28 segments per turn keeps every turn round even in the first-person close-up
+  const tubularSegments = isSoftwareGl ? 3800 : TOTAL_COIL_TURNS * 28;
+  const radialSegments = isSoftwareGl ? 7 : 12;
   const coilGeo = new THREE.TubeGeometry(
     helixCurve,
     tubularSegments,
@@ -581,6 +677,9 @@ export function buildHelicalCoilSystem(
     updateActiveTurns: () => {},
   };
 
+  let electronPhase = 0;
+  let corePhase = 0;
+
   const updateActiveTurns = (
     state: ElectromagneticTrainState,
     elapsedTime: number,
@@ -588,6 +687,11 @@ export function buildHelicalCoilSystem(
     showElectronFlow = true
   ) => {
     const [startTurn, endTurn] = state.activeTurnRange;
+    const clampedDt = Math.min(Math.max(dt, 0), 0.05);
+    const currentRatio = THREE.MathUtils.clamp(state.currentAmps / 2.3, 0, 1);
+    // Electrons drift faster with more current (drift speed is proportional to I)
+    electronPhase += clampedDt * 0.32 * currentRatio * state.direction;
+    corePhase += clampedDt * 0.55 * currentRatio * state.direction;
     const coolingFactor = Math.exp(-3.4 * Math.max(dt, 0.005));
     const trackLen = getTrackArcLength();
 
@@ -595,6 +699,13 @@ export function buildHelicalCoilSystem(
     const posArr = coilPosAttr.array as Float32Array;
     let maxDispUnits = 0;
     let anyVertexModified = false;
+    // Only the rings near the train change, so upload just that slice of the vertex buffer
+    let dirtyFirstRing = ringCount;
+    let dirtyLastRing = -1;
+    const markDirty = (ring: number) => {
+      if (ring < dirtyFirstRing) dirtyFirstRing = ring;
+      if (ring > dirtyLastRing) dirtyLastRing = ring;
+    };
 
     for (let s = 0; s < ringCount; s++) {
       const u = ringU[s];
@@ -609,6 +720,7 @@ export function buildHelicalCoilSystem(
           }
           ringWasPerturbed[s] = 0;
           anyVertexModified = true;
+          markDirty(s);
         }
         continue;
       }
@@ -623,6 +735,7 @@ export function buildHelicalCoilSystem(
           }
           ringWasPerturbed[s] = 0;
           anyVertexModified = true;
+          markDirty(s);
         }
         continue;
       }
@@ -665,9 +778,15 @@ export function buildHelicalCoilSystem(
       }
       ringWasPerturbed[s] = 1;
       anyVertexModified = true;
+      markDirty(s);
     }
 
     if (anyVertexModified) {
+      coilPosAttr.clearUpdateRanges();
+      // The train can straddle the seam at ring 0, in which case the dirty span covers the whole buffer
+      const firstVert = dirtyFirstRing * ringVerts * 3;
+      const lastVert = (dirtyLastRing + 1) * ringVerts * 3;
+      coilPosAttr.addUpdateRange(firstVert, lastVert - firstVert);
       coilPosAttr.needsUpdate = true;
     }
     // 1 world unit = 100 mm
@@ -695,16 +814,17 @@ export function buildHelicalCoilSystem(
       );
     }
 
-    // 2. Update energized X-ray conductor sheath turns in lockstep with the perturbed copper coil
-    activeTurnMat.opacity = showElectronFlow ? 0.44 : 0.78;
-    activeTurnMat.emissiveIntensity = showElectronFlow ? 0.38 : 0.25;
+    // 2. Energized X-ray sheath turns: an explanatory overlay, so it is hidden in the realistic view
+    activeTurnsInstanced.visible = showElectronFlow;
+    activeTurnMat.opacity = 0.44;
+    activeTurnMat.emissiveIntensity = 0.2 + 0.25 * currentRatio;
 
     for (let i = 0; i < TOTAL_COIL_TURNS; i++) {
       const isCurrentlyBridged =
         startTurn >= 0 &&
         i >= startTurn &&
         i <= endTurn &&
-        state.currentAmps > 0.1;
+        state.currentAmps > 0.05;
 
       if (isCurrentlyBridged) {
         thermalLevels[i] = 1.0;
@@ -763,7 +883,7 @@ export function buildHelicalCoilSystem(
     // 3. Update 180 animated electron flow particles (e-) along the perturbed copper wire turns [startTurn..endTurn]
     const hasBridgedTurns =
       showElectronFlow &&
-      state.currentAmps > 0.1 &&
+      state.currentAmps > 0.05 &&
       startTurn >= 0 &&
       endTurn > startTurn;
     const tStart = hasBridgedTurns ? startTurn / TOTAL_COIL_TURNS : 0;
@@ -780,8 +900,7 @@ export function buildHelicalCoilSystem(
         continue;
       }
 
-      const rawPhase =
-        ((p / particleCount) + elapsedTime * 0.68 * state.direction) % 1;
+      const rawPhase = ((p / particleCount) + electronPhase) % 1;
       const phase = rawPhase < 0 ? rawPhase + 1 : rawPhase;
       const coilT = THREE.MathUtils.clamp(tStart + phase * tSpan, 0, 1);
 
@@ -839,10 +958,9 @@ export function buildHelicalCoilSystem(
       }
 
       const streamIndex = cp % 3;
-      const rawCorePhase =
-        ((Math.floor(cp / 3) / 12) + elapsedTime * 0.55 * state.direction) % 1;
-      const corePhase = rawCorePhase < 0 ? rawCorePhase + 1 : rawCorePhase;
-      const coreU = wrapU(startU + corePhase * spanU);
+      const rawCorePhase = ((Math.floor(cp / 3) / 12) + corePhase) % 1;
+      const coreT = rawCorePhase < 0 ? rawCorePhase + 1 : rawCorePhase;
+      const coreU = wrapU(startU + coreT * spanU);
       const frame = evaluateTrackFrame(coreU);
 
       const binormalOffset = (streamIndex - 1) * (COIL_RADIUS_UNITS * 0.42);
@@ -900,10 +1018,20 @@ export function buildElectromagneticTrainRig(
   const rearMagnetGroup = new THREE.Group();
   const physicsOverlayGroup = new THREE.Group();
 
+  // Rolling bodies inside each magnet group: the discs spin with the battery while the field
+  // overlays, contact rings and lights stay attached to the non-rolling parent frame.
+  const frontMagnetBody = new THREE.Group();
+  const rearMagnetBody = new THREE.Group();
+  frontMagnetGroup.add(frontMagnetBody);
+  rearMagnetGroup.add(rearMagnetBody);
+  // Rig that rides on whichever magnet currently leads (first-person camera props and lights)
+  const leadGroup = new THREE.Group();
+
   rootGroup.add(batteryGroup);
   rootGroup.add(frontMagnetGroup);
   rootGroup.add(rearMagnetGroup);
   rootGroup.add(physicsOverlayGroup);
+  rootGroup.add(leadGroup);
 
   const batteryTex = createBatteryWrapperTexture(maxAnisotropy);
   const batteryRoughTex = createBatteryRoughnessMap(maxAnisotropy);
@@ -1004,6 +1132,8 @@ export function buildElectromagneticTrainRig(
   );
   const frontInsulatorMesh = new THREE.Mesh(insulatorGeo, insulatorMat);
   batteryGroup.add(frontInsulatorMesh);
+  const rearInsulatorMesh = new THREE.Mesh(insulatorGeo, insulatorMat);
+  batteryGroup.add(rearInsulatorMesh);
 
   const posButtonGeo = new THREE.CylinderGeometry(
     batteryRadius * 0.36,
@@ -1012,8 +1142,12 @@ export function buildElectromagneticTrainRig(
     24
   );
   posButtonGeo.rotateX(Math.PI / 2);
+  // Flipping the battery moves the + button to the other end; both are built and cross-faded by scale
   const posButtonMesh = new THREE.Mesh(posButtonGeo, crimpSteelMat);
   batteryGroup.add(posButtonMesh);
+  const rearPosButtonMesh = new THREE.Mesh(posButtonGeo, crimpSteelMat);
+  batteryGroup.add(rearPosButtonMesh);
+  batteryTex.center.set(0.5, 0.5);
 
   // --- PART 4 & 5: Front & Rear Neodymium (NdFeB N52) Magnet Stacks with Engraved N/S Pole Caps ---
   const nickelMagnetMat = new THREE.MeshPhysicalMaterial({
@@ -1100,15 +1234,15 @@ export function buildElectromagneticTrainRig(
     ]);
     fDisc.position.z = zOffset;
     fDisc.castShadow = !isSoftwareGl;
-    frontMagnetGroup.add(fDisc);
+    frontMagnetBody.add(fDisc);
 
     const fBevel = new THREE.Mesh(bevelRingGeo, nickelMagnetMat);
     fBevel.position.z = zOffset + singleMagnetThickness * 0.45;
-    frontMagnetGroup.add(fBevel);
+    frontMagnetBody.add(fBevel);
 
     const fWear = new THREE.Mesh(wearBandGeo, copperWearMat);
     fWear.position.z = zOffset;
-    frontMagnetGroup.add(fWear);
+    frontMagnetBody.add(fWear);
 
     const rDisc = new THREE.Mesh(discGeo, [
       nickelMagnetMat,
@@ -1117,33 +1251,33 @@ export function buildElectromagneticTrainRig(
     ]);
     rDisc.position.z = zOffset;
     rDisc.castShadow = !isSoftwareGl;
-    rearMagnetGroup.add(rDisc);
+    rearMagnetBody.add(rDisc);
 
     const rBevel = new THREE.Mesh(bevelRingGeo, nickelMagnetMat);
     rBevel.position.z = zOffset - singleMagnetThickness * 0.45;
-    rearMagnetGroup.add(rBevel);
+    rearMagnetBody.add(rBevel);
 
     const rWear = new THREE.Mesh(wearBandGeo, copperWearMat);
     rWear.position.z = zOffset;
-    rearMagnetGroup.add(rWear);
+    rearMagnetBody.add(rWear);
   }
 
   // Explicit North (Red) / South (Blue) pole indicator bands on the magnet stacks
   const frontNorthBand = new THREE.Mesh(poleBandGeo, northPoleMat);
   frontNorthBand.position.z = 1.65 * singleMagnetThickness;
-  frontMagnetGroup.add(frontNorthBand);
+  frontMagnetBody.add(frontNorthBand);
 
   const frontSouthBand = new THREE.Mesh(poleBandGeo, southPoleMat);
   frontSouthBand.position.z = -1.65 * singleMagnetThickness;
-  frontMagnetGroup.add(frontSouthBand);
+  frontMagnetBody.add(frontSouthBand);
 
   const rearNorthBand = new THREE.Mesh(poleBandGeo, northPoleMat);
   rearNorthBand.position.z = -1.65 * singleMagnetThickness;
-  rearMagnetGroup.add(rearNorthBand);
+  rearMagnetBody.add(rearNorthBand);
 
   const rearSouthBand = new THREE.Mesh(poleBandGeo, southPoleMat);
   rearSouthBand.position.z = 1.65 * singleMagnetThickness;
-  rearMagnetGroup.add(rearSouthBand);
+  rearMagnetBody.add(rearSouthBand);
 
   // --- PART 6: Sliding Electrical Contact Glow Rings + Dynamic Micro-Sparks ---
   const contactRingGeo = new THREE.TorusGeometry(
@@ -1168,29 +1302,37 @@ export function buildElectromagneticTrainRig(
   rearContactRing.layers.set(1);
   rearMagnetGroup.add(rearContactRing);
 
-  // 24 Electric Micro-Spark Filaments (12 at front contact brush, 12 at rear contact brush, in world space)
-  const sparkCount = 24;
-  const sparkGeo = new THREE.ConeGeometry(0.0052, 0.035, 6);
+  // Ballistic contact sparks: short-lived incandescent particles thrown off where the magnets slide on
+  // the wire. They live in simulated time, fall under gravity and bounce off the bench.
+  const sparkCount = isSoftwareGl ? 90 : 180;
+  const sparkGeo = new THREE.CylinderGeometry(0.0011, 0.0004, 1, 4, 1);
+  sparkGeo.translate(0, -0.5, 0);
+  sparkGeo.rotateX(-Math.PI / 2); // tail trails behind along -Z, head at the origin
   const sparkMat = new THREE.MeshBasicMaterial({
-    color: 0xe0f2fe,
+    color: 0xffffff,
+    transparent: true,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false,
+    toneMapped: false,
   });
-  const sparkInstanced = new THREE.InstancedMesh(
-    sparkGeo,
-    sparkMat,
-    sparkCount
-  );
-  sparkInstanced.layers.set(1);
+  const sparkInstanced = new THREE.InstancedMesh(sparkGeo, sparkMat, sparkCount);
   sparkInstanced.frustumCulled = false;
-  for (let s = 0; s < sparkCount; s++) {
-    sparkInstanced.setColorAt(
-      s,
-      new THREE.Color(s % 2 === 0 ? 0x7dd3fc : 0xfde047)
-    );
-  }
-  if (sparkInstanced.instanceColor) {
-    sparkInstanced.instanceColor.needsUpdate = true;
-  }
+  sparkInstanced.setColorAt(0, new THREE.Color(0xffffff));
   rootGroup.add(sparkInstanced);
+
+  const sparkPos = new Float32Array(sparkCount * 3);
+  const sparkVel = new Float32Array(sparkCount * 3);
+  const sparkLife = new Float32Array(sparkCount);
+  const sparkMaxLife = new Float32Array(sparkCount);
+  let sparkCursor = 0;
+  let sparkSpawnDebt = 0;
+  let sparkSeed = 7;
+  const sparkRand = () => {
+    sparkSeed = (sparkSeed * 16807) % 2147483647;
+    return sparkSeed / 2147483647;
+  };
+  const sparkHot = new THREE.Color(0xfff6e0);
+  const sparkCool = new THREE.Color(0xff6a1a);
 
   // --- PART 7: Multi-Shell Vertex-Colored 3D Analytical Dipole Magnetic Field Streamlines (B_magnet) ---
   const fieldLoopsGroup = new THREE.Group();
@@ -1564,17 +1706,17 @@ export function buildElectromagneticTrainRig(
   // --- PART 9: First-Person POV Interior Tunnel Interaction Rig (Layer 2: Inside-the-Coil POV) ---
   const tunnelCenterY = -gravityNormalOffset;
   const povInteriorGroup = new THREE.Group();
-  frontMagnetGroup.add(povInteriorGroup);
+  leadGroup.add(povInteriorGroup);
 
   // Warm natural copper interior PointLight illuminating the inside of the bare copper wire turns ahead
   const interiorLight = new THREE.PointLight(0xf6ad85, 1.85, 1.6, 1.25);
   interiorLight.position.set(0, tunnelCenterY + 0.025, 0.18);
-  frontMagnetGroup.add(interiorLight);
+  leadGroup.add(interiorLight);
 
-  // Secondary cool electric-arc fill light near the bottom sliding brush contact
-  const brushArcLight = new THREE.PointLight(0x38bdf8, 1.35, 0.65, 1.4);
-  brushArcLight.position.set(0, -magnetRadius * 0.72, 0.09);
-  frontMagnetGroup.add(brushArcLight);
+  // Flickering blue-white arc light at the sliding contact; its intensity follows the sparks
+  const brushArcLight = new THREE.PointLight(0xbfe3ff, 0, 0.65, 1.4);
+  brushArcLight.position.set(0, -magnetRadius * 0.72, 0.0);
+  leadGroup.add(brushArcLight);
 
   // 8 Radial Magnetic Flux Lines (B_radial) shooting outward from the leading NdFeB magnet into the copper coil turns ahead of the POV lens
   const radialBMat = new THREE.MeshBasicMaterial({
@@ -1715,13 +1857,16 @@ export function buildElectromagneticTrainRig(
   const _localTargetVec = new THREE.Vector3();
   const _scratchTangent = new THREE.Vector3();
 
+  // The train body keeps a fixed orientation along +u; polarity only decides which end carries the
+  // + terminal and which way the force pushes.
   const placeMeshOnSpine = (
     mesh: THREE.Object3D,
     axialZ: number,
     state: ElectromagneticTrainState,
-    trackLen: number
+    trackLen: number,
+    facing: 1 | -1 = 1
   ) => {
-    const u = wrapU(state.u + (axialZ / trackLen) * state.direction);
+    const u = wrapU(state.u + axialZ / trackLen);
     const frame = evaluateTrackFrame(u);
     const ripple = frame.inCoil
       ? Math.sin(u * TOTAL_COIL_TURNS * Math.PI * 2) * 0.0009
@@ -1729,12 +1874,20 @@ export function buildElectromagneticTrainRig(
     mesh.position
       .copy(frame.position)
       .addScaledVector(frame.normal, gravityNormalOffset + ripple);
-    _scratchLook
-      .copy(mesh.position)
-      .addScaledVector(frame.tangent, state.direction);
+    _scratchLook.copy(mesh.position).addScaledVector(frame.tangent, facing);
     mesh.lookAt(_scratchLook);
     return frame;
   };
+
+  // Animation state integrated in simulated time
+  let lastElapsed = -1;
+  let rollAngle = 0;
+  let polarityBlend = 1;
+  let povElectronPhase = 0;
+  // The helical wire acts a little like a screw thread, so the train slowly spins as it slides
+  const ROLL_RADIANS_PER_METER = 18;
+  const forceRestZ = 0.21;
+  const forceShaftLen = 0.34;
 
   const updateTrainPose = (
     state: ElectromagneticTrainState,
@@ -1743,42 +1896,39 @@ export function buildElectromagneticTrainRig(
   ) => {
     const trackLen = getTrackArcLength();
     const centerFrame = evaluateTrackFrame(state.u);
+    const dt =
+      lastElapsed < 0 ? 0 : THREE.MathUtils.clamp(elapsedTime - lastElapsed, 0, 0.05);
+    lastElapsed = elapsedTime;
+    const lead = travelSign(state);
 
-    // 1. Place Front & Rear Neodymium Magnet Stacks on the exact arc-length parameterized spine
-    placeMeshOnSpine(
-      frontMagnetGroup,
-      TRAIN_MAGNET_CENTER_OFFSET_UNITS,
-      state,
-      trackLen
-    );
-    placeMeshOnSpine(
-      rearMagnetGroup,
-      -TRAIN_MAGNET_CENTER_OFFSET_UNITS,
-      state,
-      trackLen
-    );
+    rollAngle += state.velocity * dt * ROLL_RADIANS_PER_METER;
+    polarityBlend +=
+      (state.direction - polarityBlend) * (1 - Math.exp(-dt * 14));
 
-    // 2. Place Battery Shoulders, Dielectric Insulator Washer & Positive Button Terminal on the exact spine
+    // 1. Magnet stacks on the spine, their discs rolling with the battery
+    placeMeshOnSpine(frontMagnetGroup, TRAIN_MAGNET_CENTER_OFFSET_UNITS, state, trackLen);
+    placeMeshOnSpine(rearMagnetGroup, -TRAIN_MAGNET_CENTER_OFFSET_UNITS, state, trackLen);
+    frontMagnetBody.rotation.z = rollAngle;
+    rearMagnetBody.rotation.z = rollAngle;
+
+    // First-person props and lights ride on the leading magnet, facing the way the train moves
+    placeMeshOnSpine(leadGroup, TRAIN_MAGNET_CENTER_OFFSET_UNITS * lead, state, trackLen, lead);
+
+    // 2. Battery shoulders and the + terminal, which swaps ends when the battery is flipped
     placeMeshOnSpine(frontShoulder, batteryLength * 0.5, state, trackLen);
     placeMeshOnSpine(rearShoulder, -batteryLength * 0.5, state, trackLen);
-    placeMeshOnSpine(
-      frontInsulatorMesh,
-      batteryLength * 0.5 + 0.002,
-      state,
-      trackLen
-    );
-    placeMeshOnSpine(
-      posButtonMesh,
-      batteryLength * 0.5 + 0.012,
-      state,
-      trackLen
-    );
+    placeMeshOnSpine(frontInsulatorMesh, batteryLength * 0.5 + 0.002, state, trackLen);
+    placeMeshOnSpine(rearInsulatorMesh, -batteryLength * 0.5 - 0.002, state, trackLen, -1);
+    placeMeshOnSpine(posButtonMesh, batteryLength * 0.5 + 0.012, state, trackLen);
+    placeMeshOnSpine(rearPosButtonMesh, -batteryLength * 0.5 - 0.012, state, trackLen, -1);
+    const frontTerminal = THREE.MathUtils.clamp((polarityBlend + 1) / 2, 0, 1);
+    posButtonMesh.scale.set(1, 1, Math.max(0.001, frontTerminal));
+    frontInsulatorMesh.scale.setScalar(Math.max(0.001, frontTerminal));
+    rearPosButtonMesh.scale.set(1, 1, Math.max(0.001, 1 - frontTerminal));
+    rearInsulatorMesh.scale.setScalar(Math.max(0.001, 1 - frontTerminal));
+    batteryTex.rotation = polarityBlend >= 0 ? 0 : Math.PI;
 
-    // 3. Spine-Conformal AA Battery Hull Deformation: every axial cross-section z0 in [-L/2, +L/2]
-    // sits at the exact center of the coil cross-section at u(z0) -> 0.000 mm lateral sagitta on all curves!
-    const rollAngle =
-      state.distanceMeters * 3.8 * state.direction +
-      Math.sin(elapsedTime * 22) * 0.012;
+    // 3. Spine-conformal battery hull: every cross-section sits on the coil axis at its own u
     const cosRoll = Math.cos(rollAngle);
     const sinRoll = Math.sin(rollAngle);
 
@@ -1798,13 +1948,12 @@ export function buildElectromagneticTrainRig(
       const ny0 = restHullNorm[i3 + 1];
       const nz0 = restHullNorm[i3 + 2];
 
-      // Rotate local cross-section by axial rolling spin
       const xr = x0 * cosRoll - y0 * sinRoll;
       const yr = x0 * sinRoll + y0 * cosRoll;
       const nxr = nx0 * cosRoll - ny0 * sinRoll;
       const nyr = nx0 * sinRoll + ny0 * cosRoll;
 
-      const uSlice = wrapU(state.u + (z0 / trackLen) * state.direction);
+      const uSlice = wrapU(state.u + z0 / trackLen);
       const sliceFrame = evaluateTrackFrame(uSlice);
       const sliceRipple = sliceFrame.inCoil
         ? Math.sin(uSlice * TOTAL_COIL_TURNS * Math.PI * 2) * 0.0009
@@ -1814,42 +1963,28 @@ export function buildElectromagneticTrainRig(
         .copy(sliceFrame.position)
         .addScaledVector(sliceFrame.normal, gravityNormalOffset + sliceRipple);
 
-      const bx = -xr * state.direction;
-      const bnX = -nxr * state.direction;
-      const tz = nz0 * state.direction;
+      const bx = -xr;
+      const bnX = -nxr;
 
-      posArr[i3] =
-        _spineCenter.x +
-        sliceFrame.binormal.x * bx +
-        sliceFrame.normal.x * yr;
-      posArr[i3 + 1] =
-        _spineCenter.y +
-        sliceFrame.binormal.y * bx +
-        sliceFrame.normal.y * yr;
-      posArr[i3 + 2] =
-        _spineCenter.z +
-        sliceFrame.binormal.z * bx +
-        sliceFrame.normal.z * yr;
+      posArr[i3] = _spineCenter.x + sliceFrame.binormal.x * bx + sliceFrame.normal.x * yr;
+      posArr[i3 + 1] = _spineCenter.y + sliceFrame.binormal.y * bx + sliceFrame.normal.y * yr;
+      posArr[i3 + 2] = _spineCenter.z + sliceFrame.binormal.z * bx + sliceFrame.normal.z * yr;
 
       normArr[i3] =
-        sliceFrame.binormal.x * bnX +
-        sliceFrame.normal.x * nyr +
-        sliceFrame.tangent.x * tz;
+        sliceFrame.binormal.x * bnX + sliceFrame.normal.x * nyr + sliceFrame.tangent.x * nz0;
       normArr[i3 + 1] =
-        sliceFrame.binormal.y * bnX +
-        sliceFrame.normal.y * nyr +
-        sliceFrame.tangent.y * tz;
+        sliceFrame.binormal.y * bnX + sliceFrame.normal.y * nyr + sliceFrame.tangent.y * nz0;
       normArr[i3 + 2] =
-        sliceFrame.binormal.z * bnX +
-        sliceFrame.normal.z * nyr +
-        sliceFrame.tangent.z * tz;
+        sliceFrame.binormal.z * bnX + sliceFrame.normal.z * nyr + sliceFrame.tangent.z * nz0;
     }
     posAttr.needsUpdate = true;
     normAttr.needsUpdate = true;
     hullGeo.computeBoundingSphere();
 
-    // 4. Update 5 Spine-Conformal 3D Solenoidal Core Field Streamlines (B_bobina) along the curved coil
-    const solenoidActive = showExplicitFields && state.currentAmps > 0.1;
+    // 4. Solenoid field lines of the energized stretch; their strength follows the current
+    const currentRatio = THREE.MathUtils.clamp(state.currentAmps / 2.3, 0, 1);
+    const solenoidActive = showExplicitFields && state.currentAmps > 0.05;
+    solenoidLineMat.opacity = 0.2 + 0.6 * currentRatio;
     for (let sIdx = 0; sIdx < solenoidStreams.length; sIdx++) {
       const stream = solenoidStreams[sIdx];
       stream.line.visible = solenoidActive;
@@ -1857,14 +1992,15 @@ export function buildElectromagneticTrainRig(
       if (!solenoidActive) continue;
 
       const { positions, localX, localY } = stream;
+      // The coil field inside the energized stretch points along the force on the magnets
+      const fieldSign = state.direction;
       for (let step = 0; step <= solenoidLineSegs; step++) {
-        const tau = step / solenoidLineSegs; // 0..1 from rear to front of energized coil zone
+        const tau = step / solenoidLineSegs;
         const zLocal = (tau - 0.5) * 0.64;
-        // Solenoid field lines flare outward near the magnet ends (|tau - 0.5| > 0.28)
         const endDist = Math.max(0, Math.abs(tau - 0.5) - 0.24) / 0.26;
         const flare = 1 + endDist * endDist * 0.42;
 
-        const uStep = wrapU(state.u + (zLocal / trackLen) * state.direction);
+        const uStep = wrapU(state.u + (zLocal / trackLen) * fieldSign);
         const stepFrame = evaluateTrackFrame(uStep);
 
         const px =
@@ -1887,29 +2023,19 @@ export function buildElectromagneticTrainRig(
 
         if (step === solenoidLineSegs) {
           stream.cone.position.set(px, py, pz);
-          _scratchLook
-            .set(px, py, pz)
-            .addScaledVector(stepFrame.tangent, state.direction);
+          _scratchLook.set(px, py, pz).addScaledVector(stepFrame.tangent, fieldSign);
           stream.cone.lookAt(_scratchLook);
         }
       }
-      const linePosAttr = stream.line.geometry.attributes
-        .position as THREE.BufferAttribute;
+      const linePosAttr = stream.line.geometry.attributes.position as THREE.BufferAttribute;
       linePosAttr.needsUpdate = true;
     }
 
-    // Position and orient dynamic contact shadow on the tabletop
-    trainShadowMesh.position.set(
-      centerFrame.position.x,
-      0.004,
-      centerFrame.position.z
-    );
-    trainShadowMesh.rotation.y = Math.atan2(
-      centerFrame.tangent.x,
-      centerFrame.tangent.z
-    );
+    // Contact shadow on the bench
+    trainShadowMesh.position.set(centerFrame.position.x, 0.004, centerFrame.position.z);
+    trainShadowMesh.rotation.y = Math.atan2(centerFrame.tangent.x, centerFrame.tangent.z);
 
-    // Position and orient 3D Physics Overlay (High-mounted arrows and 3D callout sprites)
+    // Physics overlay (arrows and label anchors) rides on the train center
     physicsOverlayGroup.position.copy(centerFrame.position);
     _scratchLook.copy(centerFrame.position).add(centerFrame.tangent);
     physicsOverlayGroup.lookAt(_scratchLook);
@@ -1919,42 +2045,45 @@ export function buildElectromagneticTrainRig(
     magneticFluxInstanced.visible = showExplicitFields;
     povInteriorGroup.visible = showExplicitFields;
 
-    // Flip force & field arrows when polarity direction reverses
+    // Arrows point along the force; their length tracks the force and field magnitudes
     directionalVectorsSubgroup.scale.z = state.direction;
+    const forceScale = THREE.MathUtils.clamp(state.propulsionForceN / 0.16, 0, 1.3);
+    forceShaft.visible = forceHead.visible = forceScale > 0.02;
+    forceShaft.scale.set(1, 1, Math.max(0.001, forceScale));
+    forceShaft.position.z = forceRestZ + (forceShaftLen * forceScale) / 2;
+    forceHead.position.z = forceRestZ + forceShaftLen * forceScale + 0.03;
+    bShaft.visible = bHead.visible = currentRatio > 0.02;
+    bShaft.scale.set(1, 1, Math.max(0.001, currentRatio));
+    bHead.position.z = 0.19 * currentRatio + 0.03;
+    povForceShaft.visible = povForceHead.visible = forceScale > 0.02;
 
-    // Update world matrices of front and rear magnet groups so flux needles and sparks lock onto them on curves
     frontMagnetGroup.updateMatrixWorld();
     rearMagnetGroup.updateMatrixWorld();
 
-    const loopSpin = elapsedTime * 0.38 * state.direction;
+    // The dipole field of an axially magnetized disc is symmetric, so its loops simply roll with it
+    const loopSpin = rollAngle;
     frontFieldLoopsSubgroup.rotation.z = loopSpin;
     rearFieldLoopsSubgroup.rotation.z = loopSpin;
 
-    // Animate 112 tangent-aligned magnetic flux needles flowing along all 28 dipole loops (N -> S)
+    // Flux needles gliding along the dipole loops (N -> S)
     for (let lIdx = 0; lIdx < dipoleLoopCurves.length; lIdx++) {
       const { curve, phi, stackSign, shell } = dipoleLoopCurves[lIdx];
       const totalPhi = phi + loopSpin;
       const cosPhi = Math.cos(totalPhi);
       const sinPhi = Math.sin(totalPhi);
       const parentMatWorld =
-        stackSign > 0
-          ? frontMagnetGroup.matrixWorld
-          : rearMagnetGroup.matrixWorld;
+        stackSign > 0 ? frontMagnetGroup.matrixWorld : rearMagnetGroup.matrixWorld;
       const speedRate = shell === 0 ? 0.34 : 0.25;
 
       for (let p = 0; p < needlesPerLoop; p++) {
         const instanceIdx = lIdx * needlesPerLoop + p;
-        const rawT =
-          ((p / needlesPerLoop) + elapsedTime * speedRate) % 1;
+        const rawT = (p / needlesPerLoop + elapsedTime * speedRate) % 1;
         const t = rawT < 0 ? rawT + 1 : rawT;
         curve.getPointAt(t, _scratchPos);
         curve.getTangentAt(t, _scratchTangent);
 
         const rx = _scratchPos.x * cosPhi - _scratchPos.y * sinPhi;
-        const ry =
-          _scratchPos.x * sinPhi +
-          _scratchPos.y * cosPhi -
-          gravityNormalOffset;
+        const ry = _scratchPos.x * sinPhi + _scratchPos.y * cosPhi - gravityNormalOffset;
         const rz = _scratchPos.z;
 
         const tx = _scratchTangent.x * cosPhi - _scratchTangent.y * sinPhi;
@@ -1969,8 +2098,7 @@ export function buildElectromagneticTrainRig(
         _dummyObj.position.copy(_localVec);
         _dummyObj.lookAt(_localTargetVec);
         const fScale =
-          (shell === 0 ? 0.92 : 0.74) *
-          (0.84 + 0.22 * Math.sin(elapsedTime * 5 + instanceIdx));
+          (shell === 0 ? 0.92 : 0.74) * (0.84 + 0.22 * Math.sin(elapsedTime * 5 + instanceIdx));
         _dummyObj.scale.setScalar(fScale);
         _dummyObj.updateMatrix();
         magneticFluxInstanced.setMatrixAt(instanceIdx, _dummyObj.matrix);
@@ -1978,9 +2106,10 @@ export function buildElectromagneticTrainRig(
     }
     magneticFluxInstanced.instanceMatrix.needsUpdate = true;
 
-    // Animate 45 POV electron particles spiraling smoothly inside the semi-translucent copper wire turns ahead of the POV camera
+    // POV electrons circulate around the turns ahead at a rate set by the current
+    povElectronPhase += dt * 2.2 * currentRatio * state.direction;
     for (let pe = 0; pe < povElectronCount; pe++) {
-      if (!showExplicitFields || state.currentAmps <= 0.1) {
+      if (!showExplicitFields || state.currentAmps <= 0.05) {
         _dummyObj.position.set(0, -10, 0);
         _dummyObj.scale.copy(_inactiveScale);
         _dummyObj.updateMatrix();
@@ -1990,9 +2119,7 @@ export function buildElectromagneticTrainRig(
       const ringSlot = pe % 9;
       const zRing = 0.14 + ringSlot * 0.026;
       const theta =
-        ((pe / povElectronCount) * Math.PI * 2 +
-          elapsedTime * 2.2 * state.direction +
-          ringSlot * 0.55) %
+        ((pe / povElectronCount) * Math.PI * 2 + povElectronPhase + ringSlot * 0.55) %
         (Math.PI * 2);
       const rWire = COIL_RADIUS_UNITS * 0.968;
       _dummyObj.position.set(
@@ -2000,68 +2127,108 @@ export function buildElectromagneticTrainRig(
         tunnelCenterY + Math.sin(theta) * rWire,
         zRing
       );
-      _dummyObj.scale.setScalar(
-        0.86 + 0.24 * Math.sin(elapsedTime * 9 + pe)
-      );
+      _dummyObj.scale.setScalar(0.86 + 0.24 * Math.sin(elapsedTime * 9 + pe));
       _dummyObj.updateMatrix();
       povElectronsInstanced.setMatrixAt(pe, _dummyObj.matrix);
     }
     povElectronsInstanced.instanceMatrix.needsUpdate = true;
 
-    // Animate contact spark rings & 24 electric micro-spark filaments locked to the bottom sliding contact of front/rear magnets
-    const contactActive = state.currentAmps > 0.1;
+    // Contact glow rings (overlay) pulse with the current
+    const contactActive = state.currentAmps > 0.05;
     frontContactRing.visible = contactActive && showExplicitFields;
     rearContactRing.visible = contactActive && showExplicitFields;
-
-    if (contactActive && showExplicitFields) {
+    if (contactActive) {
       const pulse = 0.94 + 0.12 * Math.sin(elapsedTime * 18);
       frontContactRing.scale.setScalar(pulse);
       rearContactRing.scale.setScalar(pulse);
+    }
 
-      for (let s = 0; s < sparkCount; s++) {
-        const isFront = s < sparkCount / 2;
-        const idx = s % (sparkCount / 2);
-        const baseAngle =
-          -Math.PI * 0.5 +
-          Math.sin(idx * 1.7 + elapsedTime * (isFront ? 9 : -9)) *
-            (Math.PI * 0.42);
-        const flicker = Math.sin(elapsedTime * 34 + s * 3.7);
-
-        if (flicker > -0.1) {
-          const r = magnetRadius * 1.01;
-          const parentMat = isFront
-            ? frontMagnetGroup.matrixWorld
-            : rearMagnetGroup.matrixWorld;
-          _localVec
-            .set(Math.cos(baseAngle) * r, Math.sin(baseAngle) * r, 0)
-            .applyMatrix4(parentMat);
-          _dummyObj.position.copy(_localVec);
-          _dummyObj.rotation.set(
-            Math.sin(baseAngle) * 0.8,
-            Math.cos(baseAngle) * 0.8,
-            baseAngle + Math.PI / 2
-          );
-          const sScale =
-            state.sparkIntensity * (0.65 + 0.55 * Math.abs(flicker));
-          _dummyObj.scale.setScalar(sScale);
-          _dummyObj.updateMatrix();
-          sparkInstanced.setMatrixAt(s, _dummyObj.matrix);
-        } else {
-          _dummyObj.position.set(0, -10, 0);
-          _dummyObj.scale.copy(_inactiveScale);
-          _dummyObj.updateMatrix();
-          sparkInstanced.setMatrixAt(s, _dummyObj.matrix);
-        }
+    // Spawn sparks at the two sliding contacts (bottom of each magnet), thrown backwards and upwards
+    if (state.sparkIntensity > 0 && dt > 0) {
+      sparkSpawnDebt += dt * state.sparkIntensity * 900;
+      while (sparkSpawnDebt >= 1) {
+        sparkSpawnDebt -= 1;
+        const parent = sparkRand() < 0.5 ? frontMagnetGroup : rearMagnetGroup;
+        const side = (sparkRand() - 0.5) * 0.9;
+        _localVec
+          .set(Math.sin(side) * magnetRadius, -Math.cos(side) * magnetRadius, (sparkRand() - 0.5) * 0.08)
+          .applyMatrix4(parent.matrixWorld);
+        const i = sparkCursor;
+        sparkCursor = (sparkCursor + 1) % sparkCount;
+        sparkPos[i * 3] = _localVec.x;
+        sparkPos[i * 3 + 1] = _localVec.y;
+        sparkPos[i * 3 + 2] = _localVec.z;
+        // 0.5 - 1.6 m/s ejection, in world units (1 unit = 10 cm)
+        const ejectSpeed = (0.5 + sparkRand() * 1.1) / METERS_PER_UNIT;
+        const back = -lead * (0.35 + sparkRand() * 0.6);
+        const up = 0.25 + sparkRand() * 0.9;
+        const lateral = (sparkRand() - 0.5) * 1.2;
+        const fr = centerFrame;
+        _scratchTangent
+          .copy(fr.tangent)
+          .multiplyScalar(back)
+          .addScaledVector(fr.normal, up)
+          .addScaledVector(fr.binormal, lateral)
+          .normalize()
+          .multiplyScalar(ejectSpeed);
+        sparkVel[i * 3] = _scratchTangent.x;
+        sparkVel[i * 3 + 1] = _scratchTangent.y;
+        sparkVel[i * 3 + 2] = _scratchTangent.z;
+        sparkMaxLife[i] = 0.035 + sparkRand() * 0.09;
+        sparkLife[i] = sparkMaxLife[i];
       }
-    } else {
-      for (let s = 0; s < sparkCount; s++) {
+    }
+
+    // Integrate sparks: gravity, a little air drag, bounce off the bench
+    const gravityUnits = 9.81 / METERS_PER_UNIT;
+    const drag = Math.exp(-dt * 6);
+    let liveSparks = 0;
+    for (let i = 0; i < sparkCount; i++) {
+      if (sparkLife[i] <= 0) {
         _dummyObj.position.set(0, -10, 0);
         _dummyObj.scale.copy(_inactiveScale);
         _dummyObj.updateMatrix();
-        sparkInstanced.setMatrixAt(s, _dummyObj.matrix);
+        sparkInstanced.setMatrixAt(i, _dummyObj.matrix);
+        continue;
       }
+      liveSparks++;
+      const i3 = i * 3;
+      sparkVel[i3] *= drag;
+      sparkVel[i3 + 2] *= drag;
+      sparkVel[i3 + 1] = sparkVel[i3 + 1] * drag - gravityUnits * dt;
+      sparkPos[i3] += sparkVel[i3] * dt;
+      sparkPos[i3 + 1] += sparkVel[i3 + 1] * dt;
+      sparkPos[i3 + 2] += sparkVel[i3 + 2] * dt;
+      if (sparkPos[i3 + 1] < 0.001 && sparkVel[i3 + 1] < 0) {
+        sparkPos[i3 + 1] = 0.001;
+        sparkVel[i3 + 1] *= -0.3;
+        sparkVel[i3] *= 0.6;
+        sparkVel[i3 + 2] *= 0.6;
+      }
+      sparkLife[i] -= dt;
+
+      const lifeT = THREE.MathUtils.clamp(sparkLife[i] / sparkMaxLife[i], 0, 1);
+      const speedUnits = Math.hypot(sparkVel[i3], sparkVel[i3 + 1], sparkVel[i3 + 2]);
+      _dummyObj.position.set(sparkPos[i3], sparkPos[i3 + 1], sparkPos[i3 + 2]);
+      _scratchLook
+        .set(sparkPos[i3] + sparkVel[i3], sparkPos[i3 + 1] + sparkVel[i3 + 1], sparkPos[i3 + 2] + sparkVel[i3 + 2]);
+      _dummyObj.lookAt(_scratchLook);
+      // Streak length = distance travelled in ~4 ms, as a camera shutter would smear it
+      const streak = THREE.MathUtils.clamp(speedUnits * 0.004, 0.004, 0.05);
+      const thickness = 0.6 + lifeT * 0.8;
+      _dummyObj.scale.set(thickness, thickness, streak);
+      _dummyObj.updateMatrix();
+      sparkInstanced.setMatrixAt(i, _dummyObj.matrix);
+      // Incandescent cooling: white-yellow to deep orange, fading out (additive, so darker = dimmer)
+      _scratchColor.copy(sparkCool).lerp(sparkHot, lifeT).multiplyScalar(0.35 + lifeT * 1.4);
+      sparkInstanced.setColorAt(i, _scratchColor);
     }
     sparkInstanced.instanceMatrix.needsUpdate = true;
+    if (sparkInstanced.instanceColor) sparkInstanced.instanceColor.needsUpdate = true;
+
+    // Arc light flickers with the sparks
+    const flicker = 0.55 + 0.45 * Math.sin(elapsedTime * 97) * Math.sin(elapsedTime * 61 + 1.3);
+    brushArcLight.intensity = state.sparkIntensity * flicker * 1.6 + Math.min(liveSparks, 40) * 0.01;
   };
 
   return {
