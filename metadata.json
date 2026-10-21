@@ -1,0 +1,6 @@
+{
+  "name": "Tren Electromagnético 3D — Simulación Física",
+  "description": "Simulación física 3D interactiva del tren electromagnético homopolar con pila, imanes de neodimio, bobina helicoidal conductora y campos magnéticos explícitos.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
