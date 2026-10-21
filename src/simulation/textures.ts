@@ -56,41 +56,40 @@ export function createBatteryWrapperTexture(maxAnisotropy = 4): THREE.CanvasText
     ctx.rotate(-Math.PI / 2);
 
     // Positive '+' terminal badge near front end
-    ctx.fillStyle = '#fbbf24';
+    ctx.strokeStyle = '#e2e8f0';
+    ctx.lineWidth = 4;
     ctx.beginPath();
-    ctx.arc(395, 0, 42, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = '#090b0e';
+    ctx.arc(395, 0, 40, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.fillStyle = '#f1f5f9';
     ctx.font = 'bold 64px sans-serif';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillText('+', 395, 3);
 
     // Negative '−' terminal badge near rear end
-    ctx.fillStyle = '#38bdf8';
+    ctx.strokeStyle = '#e2e8f0';
+    ctx.lineWidth = 4;
     ctx.beginPath();
-    ctx.arc(-395, 0, 42, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = '#090b0e';
+    ctx.arc(-395, 0, 40, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.fillStyle = '#f1f5f9';
     ctx.font = 'bold 68px sans-serif';
     ctx.fillText('−', -395, 3);
 
-    // Primary specification header on silver band
+    // Realistic print: brand-free chemistry, size and voltage, plus fine regulatory text
     ctx.fillStyle = '#0f172a';
-    ctx.font = 'bold 48px sans-serif';
-    ctx.fillText('ALKALINE 1.5V LR6', 36, -64);
+    ctx.font = '800 54px "Helvetica Neue", Arial, sans-serif';
+    ctx.fillText('ALKALINE', 36, -58);
 
     ctx.fillStyle = '#1e293b';
-    ctx.font = 'bold 32px monospace';
-    ctx.fillText('MOTOR LINEAL HOMOPOLAR', 36, -6);
+    ctx.font = '600 34px "Helvetica Neue", Arial, sans-serif';
+    ctx.fillText('AA  ·  LR6  ·  1.5 V', 36, 0);
 
-    // Framed technical spec table
-    ctx.strokeStyle = '#0f172a';
-    ctx.lineWidth = 3.5;
-    ctx.strokeRect(-175, 34, 420, 68);
-    ctx.fillStyle = '#0f172a';
-    ctx.font = 'bold 28px monospace';
-    ctx.fillText('I = 1.8A • NdFeB N52', 35, 68);
+    ctx.fillStyle = 'rgba(15, 23, 42, 0.7)';
+    ctx.font = '500 17px "Helvetica Neue", Arial, sans-serif';
+    ctx.fillText('Do not recharge · Insert correctly + / −', 36, 46);
+    ctx.fillText('IEC 60086 · Best before 2031-10', 36, 70);
 
     // Crossed-out wheeled bin icon on the black lower band (matching reference photo)
     ctx.strokeStyle = '#e2e8f0';
@@ -243,6 +242,30 @@ export function createNaturalCopperAlbedoTexture(
   grad.addColorStop(1, '#c98769');
   ctx.fillStyle = grad;
   ctx.fillRect(0, 0, 512, 512);
+
+  // Oxidation: soft darker tarnish blotches and a few bright freshly-rubbed spots
+  let seed = 9001;
+  const rand = () => {
+    seed = (seed * 16807) % 2147483647;
+    return seed / 2147483647;
+  };
+  for (let i = 0; i < 46; i++) {
+    const x = rand() * 512;
+    const y = rand() * 512;
+    const r = 18 + rand() * 70;
+    const blotch = ctx.createRadialGradient(x, y, 0, x, y, r);
+    const dark = rand() < 0.75;
+    const a = dark ? 0.08 + rand() * 0.14 : 0.05 + rand() * 0.08;
+    blotch.addColorStop(0, dark ? `rgba(92, 46, 30, ${a})` : `rgba(255, 214, 190, ${a})`);
+    blotch.addColorStop(1, 'rgba(0, 0, 0, 0)');
+    ctx.fillStyle = blotch;
+    ctx.fillRect(x - r, y - r, r * 2, r * 2);
+  }
+  // Faint green-brown verdigris specks where fingers touched the wire
+  for (let i = 0; i < 220; i++) {
+    ctx.fillStyle = `rgba(70, 92, 70, ${0.04 + rand() * 0.06})`;
+    ctx.fillRect(rand() * 512, rand() * 512, 1 + rand() * 2.5, 1 + rand() * 2.5);
+  }
 
   // Subtle drawn-copper micro-striations
   for (let y = 0; y < 512; y += 3) {
@@ -474,42 +497,21 @@ export function createSoftShadowTexture(): THREE.CanvasTexture {
 }
 
 /**
- * Generates a dark, moody physics laboratory backdrop where the room is in deep shadow
- * except for a soft out-of-focus side window glow on the upper-right.
+ * Small soft round sprite (white core fading to transparent) for dust motes.
  */
-export function createStudioBackdropTexture(maxAnisotropy = 4): THREE.CanvasTexture {
+export function createSoftDotTexture(): THREE.CanvasTexture {
   const canvas = document.createElement('canvas');
-  canvas.width = 1024;
-  canvas.height = 512;
+  canvas.width = 64;
+  canvas.height = 64;
   const ctx = canvas.getContext('2d')!;
-
-  // 1. Deep dark obsidian-slate laboratory wall
-  const wallGrad = ctx.createLinearGradient(0, 0, 1024, 512);
-  wallGrad.addColorStop(0, '#04060a');
-  wallGrad.addColorStop(0.55, '#070b12');
-  wallGrad.addColorStop(0.85, '#0d1320');
-  wallGrad.addColorStop(1, '#060910');
-  ctx.fillStyle = wallGrad;
-  ctx.fillRect(0, 0, 1024, 512);
-
-  // 2. Soft out-of-focus warm golden window glow on the upper-right of the dark laboratory wall
-  const windowGlow = ctx.createRadialGradient(920, 110, 10, 820, 180, 520);
-  windowGlow.addColorStop(0, 'rgba(255, 208, 135, 0.28)');
-  windowGlow.addColorStop(0.38, 'rgba(245, 158, 66, 0.10)');
-  windowGlow.addColorStop(1, 'rgba(6, 9, 15, 0.0)');
-  ctx.fillStyle = windowGlow;
-  ctx.fillRect(0, 0, 1024, 512);
-
-  // 3. Dark horizon shadow along the bottom edge where the wall meets the back of the bench
-  const bottomVig = ctx.createLinearGradient(0, 380, 0, 512);
-  bottomVig.addColorStop(0, 'rgba(5, 7, 12, 0.0)');
-  bottomVig.addColorStop(1, 'rgba(4, 6, 10, 0.88)');
-  ctx.fillStyle = bottomVig;
-  ctx.fillRect(0, 380, 1024, 132);
-
+  const grad = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+  grad.addColorStop(0, 'rgba(255, 255, 255, 1)');
+  grad.addColorStop(0.35, 'rgba(255, 255, 255, 0.45)');
+  grad.addColorStop(1, 'rgba(255, 255, 255, 0)');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, 64, 64);
   const texture = new THREE.CanvasTexture(canvas);
   texture.colorSpace = THREE.SRGBColorSpace;
-  texture.anisotropy = maxAnisotropy;
   texture.needsUpdate = true;
   return texture;
 }
