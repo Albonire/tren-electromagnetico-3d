@@ -1,1 +1,15 @@
 @import "tailwindcss";
+
+@theme {
+  /* SF Pro on Apple platforms, Inter everywhere else */
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", Inter, "Segoe UI", system-ui, sans-serif;
+}
+
+html {
+  font-family: var(--font-sans);
+  font-feature-settings: "cv11", "ss01", "ss03";
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  color-scheme: dark;
+  -webkit-tap-highlight-color: transparent;
+}

@@ -26,7 +26,6 @@ import {
   createSoftShadowTexture,
   createStudioBackdropTexture,
   createWindowSunbeamTexture,
-  createDiegeticCalloutSprite,
   createPovMicroLabelSprite,
   createPrecisionWorkbenchScaleTexture,
 } from './textures';
@@ -48,6 +47,16 @@ export interface HelicalCoilRig {
   ) => void;
 }
 
+export interface CalloutAnchor {
+  id: 'force' | 'current' | 'poles';
+  /** Invisible scene node marking where the screen-space label attaches */
+  object: THREE.Object3D;
+  symbol: string;
+  title: string;
+  subtitle: string;
+  accent: string;
+}
+
 export interface TrainRig {
   rootGroup: THREE.Group;
   batteryGroup: THREE.Group;
@@ -60,6 +69,7 @@ export interface TrainRig {
   sparkInstanced: THREE.InstancedMesh;
   forceArrowGroup: THREE.Group;
   fieldLoopsGroup: THREE.Group;
+  calloutAnchors: CalloutAnchor[];
   updateTrainPose: (
     state: ElectromagneticTrainState,
     elapsedTime: number,
@@ -861,20 +871,19 @@ export function buildHelicalCoilSystem(
 
 
 /**
- * Helper to create a 3D leader line from a component anchor point up to its 3D callout sprite.
+ * Helper to create a neutral hairline leader line from a component anchor point up to its callout label.
  */
-function createLeaderLine(
-  start: THREE.Vector3,
-  end: THREE.Vector3,
-  colorHex: number
-): THREE.Line {
+function createLeaderLine(start: THREE.Vector3, end: THREE.Vector3): THREE.Line {
   const geo = new THREE.BufferGeometry().setFromPoints([start, end]);
   const mat = new THREE.LineBasicMaterial({
-    color: colorHex,
+    color: 0xffffff,
     transparent: true,
-    opacity: 0.78,
+    opacity: 0.42,
+    depthTest: false,
   });
-  return new THREE.Line(geo, mat);
+  const line = new THREE.Line(geo, mat);
+  line.renderOrder = 24;
+  return line;
 }
 
 /**
@@ -1496,84 +1505,56 @@ export function buildElectromagneticTrainRig(
   bHead.position.set(0, COIL_RADIUS_UNITS * 1.25, 0.22);
   directionalVectorsSubgroup.add(bHead);
 
-  // --- PART 8: Staggered, Non-Overlapping 3D World-Space Callout Sprites with Leader Lines (Layer 1: External Views) ---
-  const forceCalloutPos = new THREE.Vector3(
-    0.06,
-    COIL_RADIUS_UNITS * 3.95,
-    0.72
-  );
-  const forceCallout = createDiegeticCalloutSprite(
+  // --- PART 8: Leader Lines + Screen-Space Callout Anchors (Layer 1: External Views) ---
+  // The callout text itself is rendered as crisp HTML by the UI layer; each anchor marks the
+  // top end of its leader line so the label can be projected onto the screen every frame.
+  const calloutAnchors: CalloutAnchor[] = [];
+  const addCallout = (
+    id: CalloutAnchor['id'],
+    symbol: string,
+    title: string,
+    subtitle: string,
+    accent: string,
+    from: THREE.Vector3,
+    labelPos: THREE.Vector3
+  ) => {
+    const leader = createLeaderLine(from, labelPos);
+    leader.layers.set(1);
+    forceArrowGroup.add(leader);
+
+    const anchor = new THREE.Object3D();
+    anchor.position.copy(labelPos);
+    forceArrowGroup.add(anchor);
+    calloutAnchors.push({ id, object: anchor, symbol, title, subtitle, accent });
+  };
+
+  addCallout(
+    'force',
     'F',
-    'Fuerza de Lorentz (Propulsión)',
-    'F = I · L × B_radial  ->  Impulso',
-    '#10b981'
-  );
-  forceCallout.position.copy(forceCalloutPos);
-  forceCallout.layers.set(1);
-  forceArrowGroup.add(forceCallout);
-  const forceLeader = createLeaderLine(
+    'Fuerza de Lorentz',
+    'F = I · L × B',
+    '#30d158',
     new THREE.Vector3(0, COIL_RADIUS_UNITS * 1.65, 0.48),
-    new THREE.Vector3(
-      forceCalloutPos.x,
-      forceCalloutPos.y - 0.055,
-      forceCalloutPos.z
-    ),
-    0x10b981
+    new THREE.Vector3(0.06, COIL_RADIUS_UNITS * 3.95 - 0.055, 0.72)
   );
-  forceLeader.layers.set(1);
-  forceArrowGroup.add(forceLeader);
-
-  const currentCalloutPos = new THREE.Vector3(
-    -0.02,
-    COIL_RADIUS_UNITS * 2.75,
-    -0.02
-  );
-  const currentCallout = createDiegeticCalloutSprite(
-    'e-',
-    'Flujo de Electrones en el Cobre',
-    'Partículas e- (- a +1.5V) y Campo B',
-    '#38bdf8'
-  );
-  currentCallout.position.copy(currentCalloutPos);
-  currentCallout.layers.set(1);
-  forceArrowGroup.add(currentCallout);
-  const currentLeader = createLeaderLine(
+  addCallout(
+    'current',
+    'e⁻',
+    'Flujo de electrones',
+    'Del polo − al polo + por el cobre',
+    '#64d2ff',
     new THREE.Vector3(0, COIL_RADIUS_UNITS * 1.25, 0.0),
-    new THREE.Vector3(
-      currentCalloutPos.x,
-      currentCalloutPos.y - 0.055,
-      currentCalloutPos.z
-    ),
-    0x38bdf8
+    new THREE.Vector3(-0.02, COIL_RADIUS_UNITS * 2.75 - 0.055, -0.02)
   );
-  currentLeader.layers.set(1);
-  forceArrowGroup.add(currentLeader);
-
-  const polesCalloutPos = new THREE.Vector3(
-    -0.08,
-    COIL_RADIUS_UNITS * 2.05,
-    -0.62
-  );
-  const polesCallout = createDiegeticCalloutSprite(
-    'N·S',
-    'Campo Magnético Dipolar NdFeB',
-    'Doble capa 3D de líneas B (N -> S)',
-    '#3b82f6'
-  );
-  polesCallout.position.copy(polesCalloutPos);
-  polesCallout.layers.set(1);
-  forceArrowGroup.add(polesCallout);
-  const polesLeader = createLeaderLine(
+  addCallout(
+    'poles',
+    'B',
+    'Campo de los imanes',
+    'Líneas de N a S',
+    '#0a84ff',
     new THREE.Vector3(0, COIL_RADIUS_UNITS * 0.9, -0.28),
-    new THREE.Vector3(
-      polesCalloutPos.x,
-      polesCalloutPos.y - 0.055,
-      polesCalloutPos.z
-    ),
-    0x3b82f6
+    new THREE.Vector3(-0.08, COIL_RADIUS_UNITS * 2.05 - 0.055, -0.62)
   );
-  polesLeader.layers.set(1);
-  forceArrowGroup.add(polesLeader);
 
   // Move external high-mounted arrows to layer 1 so POV inside tunnel has an unobstructed view
   directionalVectorsSubgroup.traverse((child) => {
@@ -1706,24 +1687,24 @@ export function buildElectromagneticTrainRig(
   // Micro-scale 3D POV Labels inside the coil tunnel (Layer 2) - staggered cleanly ahead of the POV lens (z = 0.23..0.27)
   const povLabelFlux = createPovMicroLabelSprite(
     'B',
-    'Campo Radial B_r (Iman -> Cobre)',
-    '#38bdf8'
+    'Campo radial B (imán a cobre)',
+    '#0a84ff'
   );
   povLabelFlux.position.set(-0.014, tunnelCenterY + 0.062, 0.24);
   povInteriorGroup.add(povLabelFlux);
 
   const povLabelForce = createPovMicroLabelSprite(
     'F',
-    'F_Lorentz = I x B_radial (Empuje)',
-    '#10b981'
+    'Empuje F = I · L × B',
+    '#30d158'
   );
   povLabelForce.position.set(0.014, tunnelCenterY + 0.024, 0.26);
   povInteriorGroup.add(povLabelForce);
 
   const povLabelContact = createPovMicroLabelSprite(
-    'e-',
-    'Flujo de Electrones e- en Cobre',
-    '#38bdf8'
+    'e⁻',
+    'Electrones en el cobre',
+    '#64d2ff'
   );
   povLabelContact.position.set(-0.012, tunnelCenterY - 0.022, 0.23);
   povInteriorGroup.add(povLabelContact);
@@ -2095,6 +2076,7 @@ export function buildElectromagneticTrainRig(
     sparkInstanced,
     forceArrowGroup,
     fieldLoopsGroup,
+    calloutAnchors,
     updateTrainPose,
   };
 }
