@@ -558,103 +558,8 @@ export function createWindowSunbeamTexture(): THREE.CanvasTexture {
 }
 
 /**
- * Creates a crisp 3D world-space diegetic callout sprite with an iOS translucent frosted-glass
- * aesthetic to label physical vectors directly in 3D space.
- */
-export function createDiegeticCalloutSprite(
-  symbol: string,
-  title: string,
-  subtitle: string,
-  accentHex: string
-): THREE.Sprite {
-  const canvas = document.createElement('canvas');
-  canvas.width = 640;
-  canvas.height = 176;
-  const ctx = canvas.getContext('2d')!;
-
-  ctx.clearRect(0, 0, 640, 176);
-
-  const x = 12;
-  const y = 12;
-  const w = 616;
-  const h = 124;
-  const r = 24;
-
-  // iOS frosted dark-glass pill card with subtle vertical sheen
-  const cardGrad = ctx.createLinearGradient(x, y, x, y + h);
-  cardGrad.addColorStop(0, 'rgba(20, 25, 35, 0.90)');
-  cardGrad.addColorStop(1, 'rgba(10, 13, 20, 0.94)');
-  ctx.fillStyle = cardGrad;
-
-  ctx.beginPath();
-  ctx.roundRect(x, y, w, h, r);
-  ctx.fill();
-
-  // Outer specular iOS glass border
-  ctx.strokeStyle = 'rgba(255, 255, 255, 0.24)';
-  ctx.lineWidth = 2.5;
-  ctx.stroke();
-
-  // Subtle accent bar on left inside the card
-  ctx.strokeStyle = accentHex;
-  ctx.lineWidth = 3.5;
-  ctx.beginPath();
-  ctx.roundRect(x + 1.5, y + 1.5, w - 3, h - 3, r - 1);
-  ctx.stroke();
-
-  // Pointer stem at bottom center
-  ctx.fillStyle = accentHex;
-  ctx.beginPath();
-  ctx.moveTo(308, y + h);
-  ctx.lineTo(332, y + h);
-  ctx.lineTo(320, y + h + 22);
-  ctx.closePath();
-  ctx.fill();
-
-  // Symbol badge circle on the left
-  ctx.fillStyle = accentHex;
-  ctx.beginPath();
-  ctx.arc(72, y + h / 2, 34, 0, Math.PI * 2);
-  ctx.fill();
-
-  ctx.fillStyle = '#090b10';
-  ctx.font = '700 30px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillText(symbol, 72, y + h / 2 + 1);
-
-  // Primary title
-  ctx.fillStyle = '#f8fafc';
-  ctx.font = '600 26px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
-  ctx.textAlign = 'left';
-  ctx.textBaseline = 'alphabetic';
-  ctx.fillText(title, 124, y + 52);
-
-  // Subtitle formula / explanation
-  ctx.fillStyle = '#cbd5e1';
-  ctx.font = '500 20px ui-monospace, SFMono-Regular, Menlo, monospace';
-  ctx.fillText(subtitle, 124, y + 92);
-
-  const texture = new THREE.CanvasTexture(canvas);
-  texture.colorSpace = THREE.SRGBColorSpace;
-  texture.needsUpdate = true;
-
-  const material = new THREE.SpriteMaterial({
-    map: texture,
-    transparent: true,
-    depthTest: false,
-    depthWrite: false,
-  });
-
-  const sprite = new THREE.Sprite(material);
-  sprite.scale.set(0.5, 0.138, 1);
-  sprite.renderOrder = 25;
-  return sprite;
-}
-
-/**
- * Creates a compact, ultra-crisp micro-scale 3D label sprite for the First-Person POV camera
- * inside the helical coil tunnel (layer 2).
+ * Creates a compact micro-scale 3D label sprite for the First-Person POV camera inside the
+ * helical coil tunnel (layer 2), styled to match the HTML glass labels of the external views.
  */
 export function createPovMicroLabelSprite(
   badge: string,
@@ -665,34 +570,31 @@ export function createPovMicroLabelSprite(
   canvas.width = 680;
   canvas.height = 116;
   const ctx = canvas.getContext('2d')!;
+  const fontStack =
+    '-apple-system, BlinkMacSystemFont, "SF Pro Text", Inter, "Segoe UI", sans-serif';
 
   ctx.clearRect(0, 0, 680, 116);
 
-  ctx.fillStyle = 'rgba(15, 19, 27, 0.88)';
-  ctx.strokeStyle = accentHex;
-  ctx.lineWidth = 3;
-
+  // Neutral dark glass capsule with a single hairline border
+  ctx.fillStyle = 'rgba(28, 28, 30, 0.82)';
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.16)';
+  ctx.lineWidth = 2;
   ctx.beginPath();
-  ctx.roundRect(8, 8, 664, 100, 22);
+  ctx.roundRect(8, 8, 664, 100, 50);
   ctx.fill();
   ctx.stroke();
 
+  // Accent symbol rendered as tinted text, no filled badge
   ctx.fillStyle = accentHex;
-  ctx.beginPath();
-  ctx.arc(56, 58, 28, 0, Math.PI * 2);
-  ctx.fill();
-
-  ctx.fillStyle = '#090b10';
-  ctx.font = '700 25px -apple-system, BlinkMacSystemFont, sans-serif';
+  ctx.font = `600 34px ${fontStack}`;
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillText(badge, 56, 60);
+  ctx.fillText(badge, 62, 59);
 
-  ctx.fillStyle = '#f8fafc';
-  ctx.font = '600 21px ui-monospace, SFMono-Regular, monospace';
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.92)';
+  ctx.font = `500 30px ${fontStack}`;
   ctx.textAlign = 'left';
-  ctx.textBaseline = 'middle';
-  ctx.fillText(label, 98, 59);
+  ctx.fillText(label, 104, 59);
 
   const texture = new THREE.CanvasTexture(canvas);
   texture.colorSpace = THREE.SRGBColorSpace;
